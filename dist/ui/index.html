@@ -6173,6 +6173,46 @@ ${component_stack}
     const day = String(date.getDate()).padStart(2, "0");
     return `${year}-${month}-${day}`;
   }
+  function archiveTaskTree(tasks, rootId, timestamp) {
+    const ids = /* @__PURE__ */ new Set([rootId]);
+    const children = /* @__PURE__ */ new Map();
+    for (const task of tasks) {
+      if (task.parent_id !== null) children.set(task.parent_id, [...children.get(task.parent_id) ?? [], task]);
+    }
+    const visit = (id2) => {
+      for (const child2 of children.get(id2) ?? []) {
+        ids.add(child2.id);
+        visit(child2.id);
+      }
+    };
+    visit(rootId);
+    let remaining = tasks;
+    for (; ; ) {
+      const parents = new Set(remaining.map((task) => task.parent_id));
+      const blanks = new Set(remaining.filter((task) => ids.has(task.id) && !task.text.trim() && !parents.has(task.id)).map((task) => task.id));
+      if (!blanks.size) break;
+      remaining = remaining.filter((task) => !blanks.has(task.id));
+    }
+    for (const task of remaining) {
+      if (ids.has(task.id)) {
+        task.archived_at = timestamp;
+        task.updated_at = timestamp;
+      }
+    }
+    const groups = /* @__PURE__ */ new Map();
+    for (const task of remaining) {
+      if (task.parent_id === null && task.archived_at === null || ids.has(task.id) && task.id !== rootId) {
+        const owner = task.parent_id;
+        groups.set(owner, [...groups.get(owner) ?? [], task]);
+      }
+    }
+    for (const siblings of groups.values()) {
+      siblings.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)).forEach((task, index2) => {
+        task.order = index2;
+      });
+    }
+    return remaining;
+  }
 
   // src/surface/surfaceBridge.ts
   var SurfaceContractError = class extends Error {
@@ -6214,6 +6254,149 @@ ${component_stack}
     return value.message.content;
   }
 
+  // src/shared/workspaceValidation.ts
+  var DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+  var WorkspaceValidationError = class extends Error {
+    constructor(message) {
+      super(`invalid Daily Notes state: ${message}`);
+      this.name = "WorkspaceValidationError";
+    }
+  };
+  function fail(message) {
+    throw new WorkspaceValidationError(message);
+  }
+  function isObject2(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  function exactKeys(value, expected, location) {
+    const actual = Object.keys(value).sort();
+    const wanted = [...expected].sort();
+    if (actual.length !== wanted.length || actual.some((key2, index2) => key2 !== wanted[index2])) {
+      fail(`${location} has unknown or missing fields`);
+    }
+  }
+  function string(value, location, options = {}) {
+    const { allowEmpty = false, maxLength } = options;
+    if (typeof value !== "string" || !allowEmpty && value.length === 0) {
+      fail(`${location} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
+    }
+    if (maxLength !== void 0 && Array.from(value).length > maxLength) {
+      fail(`${location} exceeds ${maxLength} characters`);
+    }
+  }
+  function id(value, location) {
+    string(value, location, { maxLength: MAX_ID_LENGTH });
+  }
+  function nullableString(value, location) {
+    if (value !== null) string(value, location, { maxLength: 64 });
+  }
+  function assertContiguousOrders(ordersByOwner, entity) {
+    for (const [owner, orders] of ordersByOwner) {
+      orders.sort((a, b) => a - b);
+      if (orders.some((order, index2) => order !== index2)) {
+        fail(`${entity} order is not contiguous under '${owner ?? "root"}'`);
+      }
+    }
+  }
+  function isLocalDate(value) {
+    if (!DATE_PATTERN.test(value)) return false;
+    const [year, month, day] = value.split("-").map(Number);
+    const parsed = new Date(year, month - 1, day, 12);
+    return parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day;
+  }
+  function validateWorkspace(value) {
+    if (!isObject2(value)) fail("root must be an object");
+    exactKeys(value, ["version", "entries", "tasks", "notes"], "root");
+    if (value.version !== 1) fail(`unsupported version '${String(value.version)}'`);
+    if (!Array.isArray(value.entries) || !Array.isArray(value.tasks) || !Array.isArray(value.notes)) {
+      fail("entity collections must be arrays");
+    }
+    if (value.entries.length > MAX_ENTRIES || value.tasks.length > MAX_TASKS || value.notes.length > MAX_NOTES) {
+      fail("an entity collection exceeds its supported size");
+    }
+    const entryIds = /* @__PURE__ */ new Set();
+    const dates = /* @__PURE__ */ new Set();
+    for (const [index2, raw] of value.entries.entries()) {
+      if (!isObject2(raw)) fail(`entries[${index2}] must be an object`);
+      exactKeys(raw, ["id", "local_date", "title", "created_at"], `entries[${index2}]`);
+      id(raw.id, `entries[${index2}].id`);
+      string(raw.local_date, `entries[${index2}].local_date`, { maxLength: 10 });
+      string(raw.title, `entries[${index2}].title`, { maxLength: 10 });
+      string(raw.created_at, `entries[${index2}].created_at`, { maxLength: 64 });
+      if (!isLocalDate(raw.local_date) || raw.title !== raw.local_date || raw.id !== `day-${raw.local_date}`) {
+        fail(`entries[${index2}] has an invalid local date identity`);
+      }
+      if (entryIds.has(raw.id) || dates.has(raw.local_date)) fail(`duplicate entry identity or date '${raw.local_date}'`);
+      entryIds.add(raw.id);
+      dates.add(raw.local_date);
+    }
+    const taskById = /* @__PURE__ */ new Map();
+    for (const [index2, raw] of value.tasks.entries()) {
+      if (!isObject2(raw)) fail(`tasks[${index2}] must be an object`);
+      exactKeys(raw, ["id", "parent_id", "text", "checked", "order", "created_at", "updated_at", "completed_at", "archived_at"], `tasks[${index2}]`);
+      id(raw.id, `tasks[${index2}].id`);
+      if (raw.parent_id !== null) id(raw.parent_id, `tasks[${index2}].parent_id`);
+      string(raw.text, `tasks[${index2}].text`, { allowEmpty: true, maxLength: MAX_TASK_TEXT_LENGTH });
+      if (/[\r\n]/.test(raw.text)) fail(`tasks[${index2}].text must fit on one line`);
+      if (typeof raw.checked !== "boolean") fail(`tasks[${index2}].checked must be boolean`);
+      if (!Number.isInteger(raw.order) || raw.order < 0) fail(`tasks[${index2}].order must be a non-negative integer`);
+      string(raw.created_at, `tasks[${index2}].created_at`, { maxLength: 64 });
+      string(raw.updated_at, `tasks[${index2}].updated_at`, { maxLength: 64 });
+      nullableString(raw.completed_at, `tasks[${index2}].completed_at`);
+      nullableString(raw.archived_at, `tasks[${index2}].archived_at`);
+      if (raw.checked !== (raw.completed_at !== null)) fail(`tasks[${index2}] completion metadata is inconsistent`);
+      if (taskById.has(raw.id)) fail(`duplicate task id '${raw.id}'`);
+      taskById.set(raw.id, raw);
+    }
+    const activeOrders = /* @__PURE__ */ new Map();
+    for (const task of taskById.values()) {
+      const seen = /* @__PURE__ */ new Set([task.id]);
+      let parent = task.parent_id;
+      let depth = 0;
+      while (parent !== null) {
+        const parentTask = taskById.get(parent);
+        if (!parentTask) fail(`task '${task.id}' has unknown parent '${parent}'`);
+        if (seen.has(parent)) fail(`task hierarchy contains a cycle at '${parent}'`);
+        seen.add(parent);
+        depth += 1;
+        if (depth > MAX_TASK_DEPTH) fail(`task '${task.id}' exceeds the eight-level hierarchy limit`);
+        parent = parentTask.parent_id;
+      }
+      if (task.parent_id !== null && taskById.get(task.parent_id).archived_at !== task.archived_at) {
+        fail(`task '${task.id}' archive state differs from its parent`);
+      }
+      if (task.parent_id === null && task.checked && task.archived_at === null) {
+        fail(`completed root task '${task.id}' must be archived`);
+      }
+      if (task.archived_at === null) {
+        const orders = activeOrders.get(task.parent_id) ?? [];
+        orders.push(task.order);
+        activeOrders.set(task.parent_id, orders);
+      }
+    }
+    assertContiguousOrders(activeOrders, "active task");
+    const noteIds = /* @__PURE__ */ new Set();
+    const noteOrders = /* @__PURE__ */ new Map();
+    for (const [index2, raw] of value.notes.entries()) {
+      if (!isObject2(raw)) fail(`notes[${index2}] must be an object`);
+      exactKeys(raw, ["id", "daily_entry_id", "content", "order", "collapsed", "created_at", "updated_at"], `notes[${index2}]`);
+      id(raw.id, `notes[${index2}].id`);
+      id(raw.daily_entry_id, `notes[${index2}].daily_entry_id`);
+      string(raw.content, `notes[${index2}].content`, { allowEmpty: true, maxLength: MAX_NOTE_LENGTH });
+      if (!Number.isInteger(raw.order) || raw.order < 0) fail(`notes[${index2}].order must be a non-negative integer`);
+      if (typeof raw.collapsed !== "boolean") fail(`notes[${index2}].collapsed must be boolean`);
+      string(raw.created_at, `notes[${index2}].created_at`, { maxLength: 64 });
+      string(raw.updated_at, `notes[${index2}].updated_at`, { maxLength: 64 });
+      if (!entryIds.has(raw.daily_entry_id)) fail(`note '${raw.id}' has unknown daily entry`);
+      if (noteIds.has(raw.id)) fail(`duplicate note id '${raw.id}'`);
+      noteIds.add(raw.id);
+      const orders = noteOrders.get(raw.daily_entry_id) ?? [];
+      orders.push(raw.order);
+      noteOrders.set(raw.daily_entry_id, orders);
+    }
+    assertContiguousOrders(noteOrders, "note");
+  }
+
   // src/surface/dataAdapter.ts
   var DataAdapterError = class extends Error {
     constructor(message, options) {
@@ -6227,11 +6410,11 @@ ${component_stack}
       this.name = "DataConflictError";
     }
   };
-  function isObject2(value) {
+  function isObject3(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
   function requireObject(value, label) {
-    if (!isObject2(value)) throw new DataAdapterError(`${label} must be an object`);
+    if (!isObject3(value)) throw new DataAdapterError(`${label} must be an object`);
     return value;
   }
   function requireString(value, label) {
@@ -6239,11 +6422,11 @@ ${component_stack}
     return value;
   }
   function requirePositiveInteger(value, label) {
-    if (!Number.isInteger(value) || value < 1) throw new DataAdapterError(`${label} must be a positive integer`);
+    if (!Number.isSafeInteger(value) || value < 1) throw new DataAdapterError(`${label} must be a positive integer`);
     return value;
   }
   function requireGeneration(value, label) {
-    if (!Number.isInteger(value) || value < 0) throw new DataAdapterError(`${label} must be a non-negative integer`);
+    if (!Number.isSafeInteger(value) || value < 0) throw new DataAdapterError(`${label} must be a non-negative integer`);
     return value;
   }
   function childMutationId(mutationId, suffix) {
@@ -6327,9 +6510,10 @@ ${component_stack}
       this.api = api;
     }
     generation = 0;
+    reloadWarning = null;
     records = /* @__PURE__ */ new Map();
     static fromHost(host) {
-      if (!isObject2(host) || !isObject2(host.data) || !isObject2(host.data.v2)) throw new DataAdapterError("Kestral data.v2 is unavailable");
+      if (!isObject3(host) || !isObject3(host.data) || !isObject3(host.data.v2)) throw new DataAdapterError("Kestral data.v2 is unavailable");
       const api = host.data.v2;
       if (typeof api.readSnapshot !== "function" || typeof api.beginBatch !== "function" || typeof api.appendBatchOperations !== "function" || typeof api.commitBatch !== "function" || typeof api.abortBatch !== "function") {
         throw new DataAdapterError("Kestral data.v2 is incomplete");
@@ -6343,20 +6527,40 @@ ${component_stack}
         { kind: "record-list", collection: "notes", query: { limit: 1e3 } },
         { kind: "record-list", collection: "applied-proposals", query: { limit: 1e3 } }
       ];
-      const snapshot2 = parseSnapshot(await this.api.readSnapshot({ expectedGeneration: this.generation || void 0, reads }), reads);
-      this.generation = snapshot2.generation;
-      this.records = snapshot2.records;
-      for (const collection of ["days", "tasks", "notes", "applied-proposals"]) {
-        let after = snapshot2.nextAfter.get(collection) ?? null;
-        while (after !== null) {
-          const page = { kind: "record-list", collection, query: { after, limit: 1e3 } };
-          const next2 = parseSnapshot(await this.api.readSnapshot({ expectedGeneration: this.generation, reads: [page] }), [page]);
-          if (next2.generation !== this.generation) throw new DataConflictError("Daily Notes changed while it was being read. Reload and try again.");
-          this.records.set(collection, [...this.records.get(collection) ?? [], ...next2.records.get(collection) ?? []]);
-          after = next2.nextAfter.get(collection) ?? null;
+      try {
+        const snapshot2 = parseSnapshot(await this.api.readSnapshot({ reads }), reads);
+        const records = snapshot2.records;
+        for (const collection of ["days", "tasks", "notes", "applied-proposals"]) {
+          const cursors = /* @__PURE__ */ new Set();
+          let after = snapshot2.nextAfter.get(collection) ?? null;
+          while (after !== null) {
+            if (!after || cursors.has(after)) throw new DataAdapterError("Kestral returned a repeated or empty pagination cursor.");
+            cursors.add(after);
+            const page = { kind: "record-list", collection, query: { after, limit: 1e3 } };
+            const next2 = parseSnapshot(await this.api.readSnapshot({ expectedGeneration: snapshot2.generation, reads: [page] }), [page]);
+            if (next2.generation !== snapshot2.generation) throw new DataConflictError("Daily Notes changed while it was being read. Reload and try again.");
+            records.set(collection, [...records.get(collection) ?? [], ...next2.records.get(collection) ?? []]);
+            if (records.get(collection).length > 1e4 || cursors.size > 1e4) throw new DataAdapterError("Daily Notes collection exceeds its supported size.");
+            after = next2.nextAfter.get(collection) ?? null;
+          }
+          const items = records.get(collection) ?? [];
+          if (new Set(items.map((record) => record.id)).size !== items.length || new Set(items.map((record) => record.value.id)).size !== items.length) {
+            throw new DataAdapterError(`Kestral returned duplicate records in '${collection}'.`);
+          }
         }
+        const workspace = this.workspaceFrom(records);
+        validateWorkspace(workspace);
+        this.records = records;
+        this.generation = snapshot2.generation;
+        this.reloadWarning = null;
+        return workspace;
+      } catch (error) {
+        if (isConflict(error)) throw new DataConflictError("Daily Notes changed while it was being read. Reload and try again.");
+        throw error;
       }
-      return this.workspace();
+    }
+    refreshWarning() {
+      return this.reloadWarning;
     }
     currentGeneration() {
       return this.generation;
@@ -6364,14 +6568,13 @@ ${component_stack}
     currentRecords() {
       return new Map([...this.records.entries()].map(([collection, records]) => [collection, structuredClone(records)]));
     }
-    setSnapshot(generation, records) {
-      this.generation = generation;
-      this.records = records;
-    }
     workspace() {
-      const dayRecords = this.records.get("days") ?? [];
-      const taskRecords = this.records.get("tasks") ?? [];
-      const noteRecords = this.records.get("notes") ?? [];
+      return this.workspaceFrom(this.records);
+    }
+    workspaceFrom(records) {
+      const dayRecords = records.get("days") ?? [];
+      const taskRecords = records.get("tasks") ?? [];
+      const noteRecords = records.get("notes") ?? [];
       const entries = dayRecords.map((record) => ({
         id: requireString(record.value.id, "days.value.id"),
         local_date: requireString(record.value.local_date, "days.value.local_date"),
@@ -6398,11 +6601,10 @@ ${component_stack}
         created_at: record.createdAt,
         updated_at: record.updatedAt
       }));
-      this.applyRanks(entries, tasks, notes);
+      this.applyRanks(entries, tasks, notes, records);
       return { version: 1, entries, tasks, notes };
     }
-    applyRanks(entries, tasks, notes) {
-      const byCollection = this.records;
+    applyRanks(entries, tasks, notes, byCollection) {
       const rank = (collection, id2) => {
         const record = (byCollection.get(collection) ?? []).find((candidate) => candidate.value.id === id2);
         return typeof record?.value.rank === "string" ? record.value.rank : "";
@@ -6434,6 +6636,7 @@ ${component_stack}
       });
     }
     async commit(expectedGeneration, mutationId, operations) {
+      if (this.reloadWarning !== null) throw new DataAdapterError(this.reloadWarning);
       if (operations.length === 0) return;
       if (operations.length > 2048) throw new DataAdapterError("Daily Notes mutation exceeds the data.v2 batch limit of 2048 operations.");
       let batchId = null;
@@ -6445,7 +6648,7 @@ ${component_stack}
           await this.api.appendBatchOperations({ batchId, mutationId: childMutationId(mutationId, `append-${offset / 64}`), operations: operations.slice(offset, offset + 64) });
         }
         const committed = requireObject(await this.api.commitBatch({ batchId, mutationId: childMutationId(mutationId, "commit") }), "data.v2 commit");
-        this.generation = requirePositiveInteger(committed.generation, "data.v2 commit.generation");
+        if (requirePositiveInteger(committed.generation, "data.v2 commit.generation") !== expectedGeneration + 1) throw new DataAdapterError("data.v2 commit returned an invalid generation");
       } catch (error) {
         if (batchId !== null) {
           try {
@@ -6457,7 +6660,11 @@ ${component_stack}
         if (isConflict(error)) throw new DataConflictError(void 0);
         throw new DataAdapterError("Daily Notes data could not be saved.", { cause: error });
       }
-      await this.readWorkspace();
+      this.reloadWarning = "Changes were saved, but could not be reloaded. Reload saved data before making further changes.";
+      try {
+        await this.readWorkspace();
+      } catch {
+      }
     }
   };
 
@@ -6474,28 +6681,33 @@ ${component_stack}
     if (typeof value !== "object" || value === null || Array.isArray(value)) throw new ProposalValidationError(`${label} must be an object`);
     return value;
   }
-  function string(value, label) {
+  function string2(value, label) {
     if (typeof value !== "string" || value.length === 0) throw new ProposalValidationError(`${label} must be a non-empty string`);
     return value;
   }
-  function exactKeys(value, keys, label) {
+  function identifier(value, label) {
+    const result = string2(value, label);
+    if (Array.from(result).length > MAX_ID_LENGTH) throw new ProposalValidationError(`${label} exceeds ${MAX_ID_LENGTH} characters`);
+    return result;
+  }
+  function exactKeys2(value, keys, label) {
     if (Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) throw new ProposalValidationError(`${label} has unknown or missing fields`);
   }
   function parseOperation(value, index2) {
     const operation = object(value, `payload.operations[${index2}]`);
     if (operation.kind === "create") {
-      exactKeys(operation, ["kind", "text", "parentId", "checked"].filter((key2) => Object.hasOwn(operation, key2)), `payload.operations[${index2}]`);
-      const text2 = string(operation.text, `payload.operations[${index2}].text`);
-      if (text2.length > 500 || text2.includes("\r") || text2.includes("\n")) throw new ProposalValidationError(`payload.operations[${index2}].text is invalid`);
-      if (operation.parentId !== void 0 && operation.parentId !== null) string(operation.parentId, `payload.operations[${index2}].parentId`);
+      exactKeys2(operation, ["kind", "text", "parentId", "checked"].filter((key2) => Object.hasOwn(operation, key2)), `payload.operations[${index2}]`);
+      const text2 = string2(operation.text, `payload.operations[${index2}].text`);
+      if (Array.from(text2).length > MAX_TASK_TEXT_LENGTH || text2.includes("\r") || text2.includes("\n")) throw new ProposalValidationError(`payload.operations[${index2}].text is invalid`);
+      if (operation.parentId !== void 0 && operation.parentId !== null) identifier(operation.parentId, `payload.operations[${index2}].parentId`);
       if (operation.checked !== void 0 && typeof operation.checked !== "boolean") throw new ProposalValidationError(`payload.operations[${index2}].checked is invalid`);
       return { kind: "create", text: text2, ...operation.parentId !== void 0 ? { parentId: operation.parentId } : {}, ...operation.checked !== void 0 ? { checked: operation.checked } : {} };
     }
     if (operation.kind === "update") {
-      exactKeys(operation, ["kind", "taskId", ...Object.hasOwn(operation, "text") ? ["text"] : [], ...Object.hasOwn(operation, "checked") ? ["checked"] : []], `payload.operations[${index2}]`);
-      const taskId = string(operation.taskId, `payload.operations[${index2}].taskId`);
+      exactKeys2(operation, ["kind", "taskId", ...Object.hasOwn(operation, "text") ? ["text"] : [], ...Object.hasOwn(operation, "checked") ? ["checked"] : []], `payload.operations[${index2}]`);
+      const taskId = identifier(operation.taskId, `payload.operations[${index2}].taskId`);
       if (!Object.hasOwn(operation, "text") && !Object.hasOwn(operation, "checked")) throw new ProposalValidationError(`payload.operations[${index2}] must change text or checked`);
-      if (operation.text !== void 0 && (typeof operation.text !== "string" || operation.text.length > 500 || operation.text.includes("\r") || operation.text.includes("\n"))) throw new ProposalValidationError(`payload.operations[${index2}].text is invalid`);
+      if (operation.text !== void 0 && (typeof operation.text !== "string" || Array.from(operation.text).length > MAX_TASK_TEXT_LENGTH || operation.text.includes("\r") || operation.text.includes("\n"))) throw new ProposalValidationError(`payload.operations[${index2}].text is invalid`);
       if (operation.checked !== void 0 && typeof operation.checked !== "boolean") throw new ProposalValidationError(`payload.operations[${index2}].checked is invalid`);
       return { kind: "update", taskId, ...operation.text !== void 0 ? { text: operation.text } : {}, ...operation.checked !== void 0 ? { checked: operation.checked } : {} };
     }
@@ -6505,22 +6717,33 @@ ${component_stack}
     const artifact = object(value, "artifact");
     const content = object(artifact.content, "artifact.content");
     if (artifact.artifact_type !== TASK_PROPOSAL_ARTIFACT) throw new ProposalValidationError("artifact type is not a Daily Notes task proposal");
-    exactKeys(content, ["targetAppId", "targetKind", "collection", "resourceId", "targetGeneration", "targetRevision", "payload"], "artifact.content");
+    exactKeys2(content, ["targetAppId", "targetKind", "collection", "resourceId", "targetGeneration", "targetRevision", "payload"], "artifact.content");
     if (content.targetAppId !== APP_ID || content.targetKind !== "collection" || content.collection !== "tasks") throw new ProposalValidationError("artifact target is not the Daily Notes tasks collection");
-    string(content.resourceId, "artifact.content.resourceId");
-    if (!Number.isInteger(content.targetGeneration) || content.targetGeneration < 0) throw new ProposalValidationError("artifact targetGeneration is invalid");
+    if (content.resourceId !== `app-data:${APP_ID}:tasks`) throw new ProposalValidationError("artifact resource identity does not match the Daily Notes tasks collection");
+    if (!Number.isSafeInteger(content.targetGeneration) || content.targetGeneration < 0) throw new ProposalValidationError("artifact targetGeneration is invalid");
     if (content.targetRevision !== null) throw new ProposalValidationError("collection proposal targetRevision must be null");
     const payload = object(content.payload, "artifact.content.payload");
-    exactKeys(payload, ["operations"], "artifact.content.payload");
+    exactKeys2(payload, ["operations"], "artifact.content.payload");
     if (!Array.isArray(payload.operations) || payload.operations.length < 1 || payload.operations.length > 32) throw new ProposalValidationError("proposal operation count is invalid");
     const operations = payload.operations.map(parseOperation);
-    const title = string(artifact.title, "artifact.title");
+    const title = string2(artifact.title, "artifact.title");
     return {
-      artifactId: string(artifact.artifact_id, "artifact.artifact_id"),
+      artifactId: string2(artifact.artifact_id, "artifact.artifact_id"),
       title,
       targetGeneration: content.targetGeneration,
       payload: { operations },
-      effects: operations.map((operation) => operation.kind === "create" ? `Add task: ${operation.text}` : `Update task ${operation.taskId}`)
+      effects: operations.map((operation) => {
+        if (operation.kind === "create") {
+          const parent = operation.parentId ? ` under ${operation.parentId}` : "";
+          const completion = operation.checked ? operation.parentId ? " (completed)" : " (completed; archived root)" : "";
+          return `Add task${parent}: ${operation.text}${completion}`;
+        }
+        const changes = [
+          ...operation.text !== void 0 ? [`text \u2192 ${JSON.stringify(operation.text)}`] : [],
+          ...operation.checked === void 0 ? [] : [operation.checked ? "mark complete (archives the tree if this is a root)" : "mark incomplete"]
+        ];
+        return `Update task ${operation.taskId}: ${changes.join("; ")}`;
+      })
     };
   }
   function reviewTaskProposalArtifacts(values, replayedIds, generation) {
@@ -6542,42 +6765,32 @@ ${component_stack}
       }
     });
   }
-  function applyProposalOperations(tasks, operations) {
-    const next2 = structuredClone(tasks);
+  function applyProposalOperations(tasks, operations, timestamp = (/* @__PURE__ */ new Date()).toISOString(), id2 = () => crypto.randomUUID()) {
+    let next2 = structuredClone(tasks);
     let order = next2.filter((task) => task.parent_id === null && task.archived_at === null).length;
     for (const operation of operations) {
       if (operation.kind === "create") {
         if (operation.parentId !== void 0 && operation.parentId !== null && !next2.some((task) => task.id === operation.parentId && task.archived_at === null)) return { tasks, error: `parent task '${operation.parentId}' is not active` };
-        const createdAt = (/* @__PURE__ */ new Date()).toISOString();
-        next2.push({ id: `task-${crypto.randomUUID()}`, parent_id: operation.parentId ?? null, text: operation.text, checked: operation.checked ?? false, order: operation.parentId === void 0 || operation.parentId === null ? order++ : next2.filter((task) => task.parent_id === operation.parentId && task.archived_at === null).length, created_at: createdAt, updated_at: createdAt, completed_at: operation.checked ? createdAt : null, archived_at: operation.checked && (operation.parentId === void 0 || operation.parentId === null) ? createdAt : null });
+        const createdAt = timestamp;
+        next2.push({ id: `task-${id2()}`, parent_id: operation.parentId ?? null, text: operation.text, checked: operation.checked ?? false, order: operation.parentId === void 0 || operation.parentId === null ? order++ : next2.filter((task) => task.parent_id === operation.parentId && task.archived_at === null).length, created_at: createdAt, updated_at: createdAt, completed_at: operation.checked ? createdAt : null, archived_at: operation.checked && (operation.parentId === void 0 || operation.parentId === null) ? createdAt : null });
       } else {
         const task = next2.find((candidate) => candidate.id === operation.taskId && candidate.archived_at === null);
         if (!task) return { tasks, error: `task '${operation.taskId}' is not active` };
         if (operation.text !== void 0) task.text = operation.text;
         if (operation.checked !== void 0) {
           task.checked = operation.checked;
-          task.completed_at = operation.checked ? (/* @__PURE__ */ new Date()).toISOString() : null;
+          task.completed_at = operation.checked ? timestamp : null;
           if (task.parent_id === null && operation.checked) {
-            const archivedAt = (/* @__PURE__ */ new Date()).toISOString();
-            const subtree = [task, ...descendants(next2, task.id)];
-            for (const member of subtree) member.archived_at = archivedAt;
+            next2 = archiveTaskTree(next2, task.id, timestamp);
           }
         }
-        task.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+        task.updated_at = timestamp;
       }
     }
+    next2.filter((task) => task.parent_id === null && task.archived_at === null).sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)).forEach((task, index2) => {
+      task.order = index2;
+    });
     return { tasks: next2 };
-  }
-  function descendants(tasks, rootId) {
-    const result = [];
-    const visit = (id2) => {
-      for (const child2 of tasks.filter((task) => task.parent_id === id2)) {
-        result.push(child2);
-        visit(child2.id);
-      }
-    };
-    visit(rootId);
-    return result;
   }
 
   // src/surface/presentationState.ts
@@ -6597,7 +6810,7 @@ ${component_stack}
       return this.selectedDate;
     }
     async persistSelectedDate(selectedDate) {
-      if (!isLocalDate(selectedDate)) throw new Error("Daily Notes cannot persist an invalid selected date.");
+      if (!isLocalDate2(selectedDate)) throw new Error("Daily Notes cannot persist an invalid selected date.");
       const operation = this.writes.catch(() => void 0).then(() => this.write(selectedDate));
       this.writes = operation;
       await operation;
@@ -6625,7 +6838,7 @@ ${component_stack}
   };
   function parseSelectedDate(value) {
     if (!value || Object.keys(value).sort().join("\0") !== "selected_date\0version") return null;
-    return value.version === STATE_VERSION && isLocalDate(value.selected_date) ? value.selected_date : null;
+    return value.version === STATE_VERSION && isLocalDate2(value.selected_date) ? value.selected_date : null;
   }
   function validateEntry(value) {
     if (!isRecord(value) || !Number.isSafeInteger(value.revision) || value.revision < 0) {
@@ -6636,7 +6849,7 @@ ${component_stack}
     }
     return { revision: value.revision, value: value.value };
   }
-  function isLocalDate(value) {
+  function isLocalDate2(value) {
     if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
     const [year, month, day] = value.split("-").map(Number);
     const parsed = new Date(Date.UTC(year, month - 1, day));
@@ -6644,149 +6857,6 @@ ${component_stack}
   }
   function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
-  }
-
-  // src/shared/workspaceValidation.ts
-  var DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-  var WorkspaceValidationError = class extends Error {
-    constructor(message) {
-      super(`invalid Daily Notes state: ${message}`);
-      this.name = "WorkspaceValidationError";
-    }
-  };
-  function fail(message) {
-    throw new WorkspaceValidationError(message);
-  }
-  function isObject3(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-  }
-  function exactKeys2(value, expected, location) {
-    const actual = Object.keys(value).sort();
-    const wanted = [...expected].sort();
-    if (actual.length !== wanted.length || actual.some((key2, index2) => key2 !== wanted[index2])) {
-      fail(`${location} has unknown or missing fields`);
-    }
-  }
-  function string2(value, location, options = {}) {
-    const { allowEmpty = false, maxLength } = options;
-    if (typeof value !== "string" || !allowEmpty && value.length === 0) {
-      fail(`${location} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
-    }
-    if (maxLength !== void 0 && Array.from(value).length > maxLength) {
-      fail(`${location} exceeds ${maxLength} characters`);
-    }
-  }
-  function id(value, location) {
-    string2(value, location, { maxLength: MAX_ID_LENGTH });
-  }
-  function nullableString(value, location) {
-    if (value !== null) string2(value, location, { maxLength: 64 });
-  }
-  function assertContiguousOrders(ordersByOwner, entity) {
-    for (const [owner, orders] of ordersByOwner) {
-      orders.sort((a, b) => a - b);
-      if (orders.some((order, index2) => order !== index2)) {
-        fail(`${entity} order is not contiguous under '${owner ?? "root"}'`);
-      }
-    }
-  }
-  function isLocalDate2(value) {
-    if (!DATE_PATTERN.test(value)) return false;
-    const [year, month, day] = value.split("-").map(Number);
-    const parsed = new Date(year, month - 1, day, 12);
-    return parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day;
-  }
-  function validateWorkspace(value) {
-    if (!isObject3(value)) fail("root must be an object");
-    exactKeys2(value, ["version", "entries", "tasks", "notes"], "root");
-    if (value.version !== 1) fail(`unsupported version '${String(value.version)}'`);
-    if (!Array.isArray(value.entries) || !Array.isArray(value.tasks) || !Array.isArray(value.notes)) {
-      fail("entity collections must be arrays");
-    }
-    if (value.entries.length > MAX_ENTRIES || value.tasks.length > MAX_TASKS || value.notes.length > MAX_NOTES) {
-      fail("an entity collection exceeds its supported size");
-    }
-    const entryIds = /* @__PURE__ */ new Set();
-    const dates = /* @__PURE__ */ new Set();
-    for (const [index2, raw] of value.entries.entries()) {
-      if (!isObject3(raw)) fail(`entries[${index2}] must be an object`);
-      exactKeys2(raw, ["id", "local_date", "title", "created_at"], `entries[${index2}]`);
-      id(raw.id, `entries[${index2}].id`);
-      string2(raw.local_date, `entries[${index2}].local_date`, { maxLength: 10 });
-      string2(raw.title, `entries[${index2}].title`, { maxLength: 10 });
-      string2(raw.created_at, `entries[${index2}].created_at`, { maxLength: 64 });
-      if (!isLocalDate2(raw.local_date) || raw.title !== raw.local_date || raw.id !== `day-${raw.local_date}`) {
-        fail(`entries[${index2}] has an invalid local date identity`);
-      }
-      if (entryIds.has(raw.id) || dates.has(raw.local_date)) fail(`duplicate entry identity or date '${raw.local_date}'`);
-      entryIds.add(raw.id);
-      dates.add(raw.local_date);
-    }
-    const taskById = /* @__PURE__ */ new Map();
-    for (const [index2, raw] of value.tasks.entries()) {
-      if (!isObject3(raw)) fail(`tasks[${index2}] must be an object`);
-      exactKeys2(raw, ["id", "parent_id", "text", "checked", "order", "created_at", "updated_at", "completed_at", "archived_at"], `tasks[${index2}]`);
-      id(raw.id, `tasks[${index2}].id`);
-      if (raw.parent_id !== null) id(raw.parent_id, `tasks[${index2}].parent_id`);
-      string2(raw.text, `tasks[${index2}].text`, { allowEmpty: true, maxLength: MAX_TASK_TEXT_LENGTH });
-      if (/[\r\n]/.test(raw.text)) fail(`tasks[${index2}].text must fit on one line`);
-      if (typeof raw.checked !== "boolean") fail(`tasks[${index2}].checked must be boolean`);
-      if (!Number.isInteger(raw.order) || raw.order < 0) fail(`tasks[${index2}].order must be a non-negative integer`);
-      string2(raw.created_at, `tasks[${index2}].created_at`, { maxLength: 64 });
-      string2(raw.updated_at, `tasks[${index2}].updated_at`, { maxLength: 64 });
-      nullableString(raw.completed_at, `tasks[${index2}].completed_at`);
-      nullableString(raw.archived_at, `tasks[${index2}].archived_at`);
-      if (raw.checked !== (raw.completed_at !== null)) fail(`tasks[${index2}] completion metadata is inconsistent`);
-      if (taskById.has(raw.id)) fail(`duplicate task id '${raw.id}'`);
-      taskById.set(raw.id, raw);
-    }
-    const activeOrders = /* @__PURE__ */ new Map();
-    for (const task of taskById.values()) {
-      const seen = /* @__PURE__ */ new Set([task.id]);
-      let parent = task.parent_id;
-      let depth = 0;
-      while (parent !== null) {
-        const parentTask = taskById.get(parent);
-        if (!parentTask) fail(`task '${task.id}' has unknown parent '${parent}'`);
-        if (seen.has(parent)) fail(`task hierarchy contains a cycle at '${parent}'`);
-        seen.add(parent);
-        depth += 1;
-        if (depth > MAX_TASK_DEPTH) fail(`task '${task.id}' exceeds the eight-level hierarchy limit`);
-        parent = parentTask.parent_id;
-      }
-      if (task.parent_id !== null && taskById.get(task.parent_id).archived_at !== task.archived_at) {
-        fail(`task '${task.id}' archive state differs from its parent`);
-      }
-      if (task.parent_id === null && task.checked && task.archived_at === null) {
-        fail(`completed root task '${task.id}' must be archived`);
-      }
-      if (task.archived_at === null) {
-        const orders = activeOrders.get(task.parent_id) ?? [];
-        orders.push(task.order);
-        activeOrders.set(task.parent_id, orders);
-      }
-    }
-    assertContiguousOrders(activeOrders, "active task");
-    const noteIds = /* @__PURE__ */ new Set();
-    const noteOrders = /* @__PURE__ */ new Map();
-    for (const [index2, raw] of value.notes.entries()) {
-      if (!isObject3(raw)) fail(`notes[${index2}] must be an object`);
-      exactKeys2(raw, ["id", "daily_entry_id", "content", "order", "collapsed", "created_at", "updated_at"], `notes[${index2}]`);
-      id(raw.id, `notes[${index2}].id`);
-      id(raw.daily_entry_id, `notes[${index2}].daily_entry_id`);
-      string2(raw.content, `notes[${index2}].content`, { allowEmpty: true, maxLength: MAX_NOTE_LENGTH });
-      if (!Number.isInteger(raw.order) || raw.order < 0) fail(`notes[${index2}].order must be a non-negative integer`);
-      if (typeof raw.collapsed !== "boolean") fail(`notes[${index2}].collapsed must be boolean`);
-      string2(raw.created_at, `notes[${index2}].created_at`, { maxLength: 64 });
-      string2(raw.updated_at, `notes[${index2}].updated_at`, { maxLength: 64 });
-      if (!entryIds.has(raw.daily_entry_id)) fail(`note '${raw.id}' has unknown daily entry`);
-      if (noteIds.has(raw.id)) fail(`duplicate note id '${raw.id}'`);
-      noteIds.add(raw.id);
-      const orders = noteOrders.get(raw.daily_entry_id) ?? [];
-      orders.push(raw.order);
-      noteOrders.set(raw.daily_entry_id, orders);
-    }
-    assertContiguousOrders(noteOrders, "note");
   }
 
   // src/surface/workspaceStore.ts
@@ -6817,7 +6887,7 @@ ${component_stack}
       task.order = index2;
     });
   }
-  function descendants2(tasks, rootId) {
+  function descendants(tasks, rootId) {
     const result = [];
     const visit = (id2) => {
       for (const child2 of tasks.filter((task) => task.parent_id === id2)) {
@@ -6895,6 +6965,12 @@ ${component_stack}
       this.id = id2;
     }
     workspace = { version: 1, entries: [], tasks: [], notes: [] };
+    operations = Promise.resolve();
+    enqueue(operation) {
+      const result = this.operations.then(operation);
+      this.operations = result.then(() => void 0, () => void 0);
+      return result;
+    }
     static async open(data, now, id2) {
       const store = new _FrontendWorkspaceStore(data, now, id2);
       store.workspace = data.workspace();
@@ -6902,9 +6978,10 @@ ${component_stack}
       return store;
     }
     async refresh() {
-      this.workspace = await this.data.readWorkspace();
-      validateWorkspace(this.workspace);
-      return this.snapshot();
+      return this.enqueue(async () => {
+        this.workspace = await this.data.readWorkspace();
+        return this.snapshot();
+      });
     }
     snapshot() {
       return clone(this.workspace);
@@ -6941,25 +7018,26 @@ ${component_stack}
       }
       return operations;
     }
-    async transact(mutate2, extraOperations = []) {
-      const draft = clone(this.workspace);
-      mutate2(draft, this.now().toISOString());
-      this.sort(draft);
-      validateWorkspace(draft);
-      try {
-        await this.data.commit(this.data.currentGeneration(), this.id(), [...this.operationsFor(draft), ...extraOperations]);
-      } catch (error) {
-        if (error instanceof DataAdapterError) throw error;
-        throw new DataAdapterError("Daily Notes data could not be saved.", { cause: error });
-      }
-      this.workspace = await this.data.readWorkspace();
-      return this.snapshot();
+    transact(mutate2, extraOperations = []) {
+      return this.enqueue(async () => {
+        const warning = this.data.refreshWarning();
+        if (warning !== null) throw new DataAdapterError(warning);
+        const draft = clone(this.workspace);
+        mutate2(draft, this.now().toISOString());
+        this.sort(draft);
+        validateWorkspace(draft);
+        try {
+          await this.data.commit(this.data.currentGeneration(), this.id(), [...this.operationsFor(draft), ...extraOperations]);
+        } catch (error) {
+          if (error instanceof DataAdapterError) throw error;
+          throw new DataAdapterError("Daily Notes data could not be saved.", { cause: error });
+        }
+        this.workspace = this.data.refreshWarning() === null ? this.data.workspace() : draft;
+        return this.snapshot();
+      });
     }
     async getOrCreateDay(localDate2) {
-      if (!isLocalDate2(localDate2)) reject("local_date must be a real calendar date using YYYY-MM-DD");
-      const existing = this.workspace.entries.some((entry) => entry.local_date === localDate2);
-      const stale = this.workspace.tasks.some((task) => task.archived_at === null && !task.text.trim() && !this.workspace.tasks.some((candidate) => candidate.parent_id === task.id));
-      if (existing && !stale) return this.snapshot();
+      if (!isLocalDate(localDate2)) reject("local_date must be a real calendar date using YYYY-MM-DD");
       return this.transact((draft, timestamp) => {
         for (; ; ) {
           const blank = draft.tasks.filter((task) => task.archived_at === null && !task.text.trim() && !draft.tasks.some((candidate) => candidate.parent_id === task.id));
@@ -7052,18 +7130,7 @@ ${component_stack}
         task.completed_at = checked ? timestamp : null;
         task.updated_at = timestamp;
         if (task.parent_id === null && checked) {
-          const subtreeIds = /* @__PURE__ */ new Set([task.id, ...descendants2(draft.tasks, task.id).map((member) => member.id)]);
-          for (; ; ) {
-            const blanks = draft.tasks.filter((candidate) => subtreeIds.has(candidate.id) && !candidate.text.trim() && !draft.tasks.some((possibleChild) => possibleChild.parent_id === candidate.id));
-            if (blanks.length === 0) break;
-            for (const blank of blanks) subtreeIds.delete(blank.id);
-            draft.tasks = draft.tasks.filter((candidate) => !blanks.some((blank) => blank.id === candidate.id));
-          }
-          for (const member of [task, ...descendants2(draft.tasks, task.id)]) {
-            member.archived_at = timestamp;
-            member.updated_at = timestamp;
-          }
-          normalizeOrders(draft.tasks, null, false);
+          draft.tasks = archiveTaskTree(draft.tasks, task.id, timestamp);
         }
       });
     }
@@ -7073,7 +7140,7 @@ ${component_stack}
         if (!root || root.parent_id !== null || root.archived_at === null) reject("restore requires an archived root task");
         root.checked = false;
         root.completed_at = null;
-        for (const member of [root, ...descendants2(draft.tasks, root.id)]) {
+        for (const member of [root, ...descendants(draft.tasks, root.id)]) {
           member.archived_at = null;
           member.updated_at = timestamp;
         }
@@ -7162,7 +7229,7 @@ ${component_stack}
           parents[depth] = task.id;
           parents.length = depth + 1;
         }
-        for (const root of imported.filter((task) => task.parent_id === null && task.checked)) for (const member of [root, ...descendants2(imported, root.id)]) member.archived_at = timestamp;
+        for (const root of imported.filter((task) => task.parent_id === null && task.checked)) for (const member of [root, ...descendants(imported, root.id)]) member.archived_at = timestamp;
         normalizeOrders(draft.tasks, null, false);
       });
     }
@@ -7216,18 +7283,19 @@ ${component_stack}
       return new Set((this.data.currentRecords().get("applied-proposals") ?? []).map((record) => String(record.value.artifactId)));
     }
     async applyTaskProposal(artifactId, targetGeneration, payload) {
-      if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
-      if (this.data.currentGeneration() !== targetGeneration) reject(`this proposal is stale; it targets generation ${targetGeneration}, while the workspace is at generation ${this.data.currentGeneration()}`);
       const receipt = this.proposalReceipt(artifactId, "applied", targetGeneration);
-      return this.transact((draft) => {
-        const result = applyProposalOperations(draft.tasks, payload.operations);
+      return this.transact((draft, timestamp) => {
+        if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
+        if (this.data.currentGeneration() !== targetGeneration) reject(`this proposal is stale; it targets generation ${targetGeneration}, while the workspace is at generation ${this.data.currentGeneration()}`);
+        const result = applyProposalOperations(draft.tasks, payload.operations, timestamp, this.id);
         if (result.error) reject(result.error);
         draft.tasks = result.tasks;
       }, [{ kind: "create", collection: "applied-proposals", value: receipt }]);
     }
     async rejectTaskProposal(artifactId, targetGeneration) {
-      if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
-      return this.transact(() => void 0, [{ kind: "create", collection: "applied-proposals", value: this.proposalReceipt(artifactId, "rejected", targetGeneration) }]);
+      return this.transact(() => {
+        if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
+      }, [{ kind: "create", collection: "applied-proposals", value: this.proposalReceipt(artifactId, "rejected", targetGeneration) }]);
     }
     proposalReceipt(artifactId, status, targetGeneration) {
       return { id: `proposal-${artifactId}`, artifactId, recordedAt: this.now().toISOString(), status, targetGeneration };
@@ -7355,7 +7423,7 @@ ${component_stack}
   var root_7 = from_html(`<p class="empty-state svelte-1u9rne1">Loading today's workspace...</p>`);
   var root_8 = from_html(`<button type="button" class="secondary svelte-1u9rne1">Today</button>`);
   var root_9 = from_html(`<button type="button" class="secondary svelte-1u9rne1">Retry task creation</button>`);
-  var root_10 = from_html(`<div class="error svelte-1u9rne1" role="alert"><span> </span><div class="button-group svelte-1u9rne1"><!><button type="button" aria-label="Dismiss error" class="svelte-1u9rne1">Dismiss</button></div></div>`);
+  var root_10 = from_html(`<div class="error svelte-1u9rne1" role="alert"><span> </span><div class="button-group svelte-1u9rne1"><!><button type="button" class="secondary svelte-1u9rne1">Reload saved data</button><button type="button" aria-label="Dismiss error" class="svelte-1u9rne1">Dismiss</button></div></div>`);
   var root_11 = from_html(`<li> </li>`);
   var root_12 = from_html(`<ul class="proposal-effects svelte-1u9rne1"></ul>`);
   var root_13 = from_html(`<div class="button-group svelte-1u9rne1"><button type="button" class="svelte-1u9rne1">Apply</button><button type="button" class="secondary svelte-1u9rne1">Reject</button></div>`);
@@ -7428,6 +7496,8 @@ ${component_stack}
     let undoRootId = state(null);
     let deleteNoteConfirmation = state(null);
     let searchTarget = state(null);
+    let disposed = false;
+    let rolloverInProgress = false;
     let rolloverTimer = null;
     let captureConversionTimer = null;
     const saveTimers = /* @__PURE__ */ new Map();
@@ -7623,9 +7693,13 @@ ${component_stack}
             throw new Error(`Unknown Daily Notes operation '${capability}'`);
         }
         if (isCurrentResponse(sequence)) {
-          set(error, null);
+          set(error, data?.refreshWarning() ?? null, true);
           applyWorkspace(next2, sequence);
-          set(status, hasPendingEdits() ? "Unsaved changes" : "Saved locally", true);
+          set(
+            status,
+            get2(error) ? "Saved; reload required" : hasPendingEdits() ? "Unsaved changes" : "Saved locally",
+            true
+          );
         }
         return next2;
       } catch (failure) {
@@ -7650,9 +7724,13 @@ ${component_stack}
           checked: input.checked
         });
         if (isCurrentResponse(sequence)) {
-          set(error, null);
+          set(error, data?.refreshWarning() ?? null, true);
           applyWorkspace(created.workspace, sequence);
-          set(status, hasPendingEdits() ? "Unsaved changes" : "Saved locally", true);
+          set(
+            status,
+            get2(error) ? "Saved; reload required" : hasPendingEdits() ? "Unsaved changes" : "Saved locally",
+            true
+          );
         }
         return created;
       } catch (failure) {
@@ -7694,6 +7772,14 @@ ${component_stack}
         set(error, `Copy failed: ${String(failure)}`);
       }
     }
+    async function reloadWorkspace() {
+      for (const timer of saveTimers.values()) clearTimeout(timer);
+      saveTimers.clear();
+      const next2 = await invoke("get_workspace", {}, { failureStatus: "Refresh failed" });
+      if (!next2) return;
+      if (hasPendingEdits()) set(status, "Workspace reloaded. Unsaved drafts retained; review before saving.");
+      await refreshProposals();
+    }
     async function refreshProposals() {
       if (!host || !get2(store)) return;
       try {
@@ -7718,14 +7804,15 @@ ${component_stack}
       );
     }
     async function applyProposal(review) {
-      if (review.state !== "ready" || !review.parsed || !get2(store)) return;
-      if (!await flushPendingEdits()) return;
+      if (get2(proposalBusyId) !== null || review.state !== "ready" || !review.parsed || !get2(store)) return;
       const artifactId = review.artifact.artifact_id;
       set(proposalBusyId, artifactId, true);
       try {
+        if (!await flushPendingEdits()) return;
         const next2 = await get2(store).applyTaskProposal(artifactId, review.parsed.targetGeneration, review.parsed.payload);
-        set(workspace, next2, true);
-        set(status, "Task proposal applied");
+        set(workspace, mergeLocalEdits(next2), true);
+        set(error, data?.refreshWarning() ?? null, true);
+        set(status, get2(error) ? "Saved; reload required" : "Task proposal applied", true);
         markProposalHandled(artifactId);
         await refreshProposals();
       } catch (failure) {
@@ -7737,12 +7824,13 @@ ${component_stack}
       }
     }
     async function rejectProposal(review) {
-      if (!review.parsed || !get2(store) || review.state === "replayed") return;
+      if (get2(proposalBusyId) !== null || !review.parsed || !get2(store) || review.state === "replayed") return;
       const artifactId = review.artifact.artifact_id;
       set(proposalBusyId, artifactId, true);
       try {
         await get2(store).rejectTaskProposal(artifactId, review.parsed.targetGeneration);
-        set(status, "Task proposal rejected");
+        set(error, data?.refreshWarning() ?? null, true);
+        set(status, get2(error) ? "Saved; reload required" : "Task proposal rejected", true);
         markProposalHandled(artifactId);
         await refreshProposals();
       } catch (failure) {
@@ -7872,7 +7960,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       if (get2(deletingTasks).has(task.id)) return;
       set(deletingTasks, new Set(get2(deletingTasks)).add(task.id), true);
       try {
-        if (!await saveTask(task.id, true)) return;
+        if (!await saveTask(task.id)) return;
         if (!get2(workspace).tasks.some((candidate) => candidate.id === task.id)) return;
         const next2 = await invoke("delete_task", { id: task.id });
         if (next2) {
@@ -7889,14 +7977,14 @@ ${"  ".repeat(task.depth + 1)}`)}`;
         set(deletingTasks, remaining, true);
       }
     }
-    async function saveTask(id2, flushLatest = false) {
+    async function saveTask(id2) {
       const timer = saveTimers.get(id2);
       if (timer) clearTimeout(timer);
       saveTimers.delete(id2);
       const pending2 = taskSaves.get(id2);
       if (pending2) {
         const saved2 = await pending2;
-        return saved2 && (!flushLatest || await saveTask(id2, true));
+        return saved2 && await saveTask(id2);
       }
       const dirty = dirtyTasks.get(id2);
       if (!dirty) return true;
@@ -7914,12 +8002,12 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       } finally {
         if (taskSaves.get(id2) === save2) taskSaves.delete(id2);
       }
-      return saved && (!flushLatest || await saveTask(id2, true));
+      return saved && await saveTask(id2);
     }
     async function normalizeAndSaveTask(task, value) {
       const normalized = normalizeTaskText(value);
       if (normalized.text !== value) updateLocalTask(task.id, normalized.text);
-      if (!await saveTask(task.id, true)) return;
+      if (!await saveTask(task.id)) return;
       if (normalized.checked !== null && normalized.checked !== task.checked) await toggleTask(task.id, normalized.checked);
     }
     function pendingTasksChanged() {
@@ -8137,7 +8225,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
         }
       }
       const id2 = await editorLineTaskId(line);
-      if (!id2 || !await saveTask(id2, true)) return;
+      if (!id2 || !await saveTask(id2)) return;
       const next2 = await invoke("move_task", { id: id2, direction });
       if (next2) await focusEditorLine(id2, relative);
     }
@@ -8220,7 +8308,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
         removeIds.push(id2);
       }
       for (const id2 of /* @__PURE__ */ new Set([...keepId ? [keepId] : [], ...removeIds])) {
-        if (!await saveTask(id2, true)) return;
+        if (!await saveTask(id2)) return;
       }
       if (removeIds.length > 0) {
         const next2 = await invoke("replace_task_lines", { keep_id: keepId, text: edit.text, remove_ids: removeIds });
@@ -8229,7 +8317,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
         if (keepId) discardTaskEdit(keepId);
       } else if (keepLine) {
         updateEditorLine(keepLine, edit.text);
-        if (keepId && !await saveTask(keepId, true)) return;
+        if (keepId && !await saveTask(keepId)) return;
       }
       if (removeLines.some((line) => line.kind === "capture")) {
         updateCapture("");
@@ -8365,7 +8453,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       }
     }
     async function toggleTask(id2, checked) {
-      if (!await saveTask(id2, true)) return;
+      if (!await saveTask(id2)) return;
       const task = get2(workspace).tasks.find((candidate) => candidate.id === id2);
       const next2 = await invoke("toggle_task", { id: id2, checked });
       if (next2 && task?.parent_id === null && checked) {
@@ -8396,14 +8484,14 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       if (prior) clearTimeout(prior);
       saveTimers.set(id2, setTimeout(() => void saveNote(id2), 500));
     }
-    async function saveNote(id2, flushLatest = false) {
+    async function saveNote(id2) {
       const timer = saveTimers.get(id2);
       if (timer) clearTimeout(timer);
       saveTimers.delete(id2);
       const pending2 = noteSaves.get(id2);
       if (pending2) {
         const saved2 = await pending2;
-        return saved2 && (!flushLatest || await saveNote(id2, true));
+        return saved2 && await saveNote(id2);
       }
       const dirty = dirtyNotes.get(id2);
       if (!dirty) return true;
@@ -8421,13 +8509,13 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       } finally {
         if (noteSaves.get(id2) === save2) noteSaves.delete(id2);
       }
-      return saved && (!flushLatest || await saveNote(id2, true));
+      return saved && await saveNote(id2);
     }
     async function deleteNote(note) {
       if (get2(deletingNotes).has(note.id)) return;
       set(deletingNotes, new Set(get2(deletingNotes)).add(note.id), true);
       try {
-        if (!await saveNote(note.id, true)) return;
+        if (!await saveNote(note.id)) return;
         const next2 = await invoke("delete_note", { id: note.id });
         if (next2) {
           const timer = saveTimers.get(note.id);
@@ -8455,7 +8543,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
         },
         true
       );
-      if (!await saveNote(note.id, true)) {
+      if (!await saveNote(note.id)) {
         pendingCollapsed.delete(note.id);
         set(
           workspace,
@@ -8479,7 +8567,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       );
     }
     async function flushNoteEdits() {
-      for (const id2 of /* @__PURE__ */ new Set([...dirtyNotes.keys(), ...noteSaves.keys()])) if (!await saveNote(id2, true)) return false;
+      for (const id2 of /* @__PURE__ */ new Set([...dirtyNotes.keys(), ...noteSaves.keys()])) if (!await saveNote(id2)) return false;
       return true;
     }
     async function flushPendingEdits() {
@@ -8487,7 +8575,7 @@ ${"  ".repeat(task.depth + 1)}`)}`;
       for (const pending2 of pendingTasks.values()) {
         if (!pending2.hidden && await startPendingTaskCreation(pending2.id) === null) return false;
       }
-      for (const id2 of /* @__PURE__ */ new Set([...dirtyTasks.keys(), ...taskSaves.keys()])) if (!await saveTask(id2, true)) return false;
+      for (const id2 of /* @__PURE__ */ new Set([...dirtyTasks.keys(), ...taskSaves.keys()])) if (!await saveTask(id2)) return false;
       return flushNoteEdits();
     }
     async function toggleAllNotes() {
@@ -8668,7 +8756,7 @@ ${noteText || "No notes."}${taskText}`;
       }
     }
     async function rewrite(note) {
-      if (!await saveNote(note.id, true)) return;
+      if (!await saveNote(note.id)) return;
       const original = get2(workspace).notes.find((candidate) => candidate.id === note.id)?.content ?? note.content;
       if (get2(rewriteOperation) === "translate" && !get2(rewriteLanguage).trim()) {
         set(error, "Enter a target language before translating. Your note was not changed.");
@@ -8721,24 +8809,40 @@ ${noteText || "No notes."}${taskText}`;
         set(aiConfirming, false);
       }
     }
-    function scheduleRollover() {
+    function scheduleRollover(retry = false) {
       if (rolloverTimer) clearTimeout(rolloverTimer);
+      if (disposed) return;
       const now = /* @__PURE__ */ new Date();
       const next2 = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 1);
-      rolloverTimer = setTimeout(() => void checkRollover(), next2.getTime() - now.getTime());
+      rolloverTimer = setTimeout(() => void checkRollover(), retry ? 3e4 : next2.getTime() - now.getTime());
     }
     async function checkRollover() {
-      const nextToday = localDate();
-      if (nextToday !== get2(today)) {
-        const viewedCurrent = get2(selectedDate) === get2(today);
-        set(today, nextToday, true);
+      if (disposed || rolloverInProgress || !get2(store)) return;
+      rolloverInProgress = true;
+      let retry = false;
+      try {
+        const nextToday = localDate();
+        if (nextToday === get2(today)) return;
+        const previousToday = get2(today);
+        const viewedCurrent = get2(selectedDate) === previousToday;
+        if (!await flushPendingEdits() || disposed) {
+          retry = true;
+          return;
+        }
         const next2 = await invoke("get_or_create_day", { local_date: nextToday }, { showBusy: false, failureStatus: "Refresh failed" });
-        if (next2 && viewedCurrent && await flushPendingEdits()) {
+        if (!next2 || disposed) {
+          retry = true;
+          return;
+        }
+        set(today, nextToday, true);
+        if (viewedCurrent && get2(selectedDate) === previousToday) {
           set(selectedDate, nextToday, true);
           void persistSelectedDate(nextToday);
-        } else if (next2) set(status, `A new daily entry is ready for ${nextToday}.`);
+        } else set(status, `A new daily entry is ready for ${nextToday}.`);
+      } finally {
+        rolloverInProgress = false;
+        scheduleRollover(retry);
       }
-      scheduleRollover();
     }
     function loadInitialDay(date) {
       if (startupPromise) return startupPromise;
@@ -8784,14 +8888,18 @@ ${noteText || "No notes."}${taskText}`;
         set(error, "Kestral's data.v2 bridge is unavailable.");
         return;
       }
+      disposed = false;
       host.ready();
-      host.onEvent?.(() => void get2(store)?.refresh().then((next2) => {
-        set(workspace, next2, true);
-        return refreshProposals();
-      }).catch((failure) => {
-        set(error, failure instanceof Error ? failure.message : String(failure), true);
-        set(status, "Refresh failed");
-      }));
+      host.onEvent?.(() => {
+        if (disposed || !get2(store)) return;
+        if (hasPendingEdits()) {
+          void refreshProposals();
+          return;
+        }
+        void invoke("get_workspace", {}, { showBusy: false, failureStatus: "Refresh failed" }).then((next2) => {
+          if (next2 && !disposed) return refreshProposals();
+        });
+      });
       const visibility = () => {
         if (document.hidden) void flushPendingEdits();
         else void checkRollover();
@@ -8800,6 +8908,7 @@ ${noteText || "No notes."}${taskText}`;
       void loadInitialDay(initialDate);
       scheduleRollover();
       return () => {
+        disposed = true;
         document.removeEventListener("visibilitychange", visibility);
         if (rolloverTimer) clearTimeout(rolloverTimer);
         if (captureConversionTimer) clearTimeout(captureConversionTimer);
@@ -8942,10 +9051,15 @@ ${noteText || "No notes."}${taskText}`;
               });
             }
             var button_5 = sibling(node_7);
+            var button_6 = sibling(button_5);
             reset(div_3);
             reset(div_2);
-            template_effect(() => set_text(text_8, get2(error)));
-            delegated("click", button_5, () => set(error, null));
+            template_effect(() => {
+              set_text(text_8, get2(error));
+              button_5.disabled = get2(busy);
+            });
+            delegated("click", button_5, () => void reloadWorkspace());
+            delegated("click", button_6, () => set(error, null));
             append($$anchor3, div_2);
           };
           if_block(node_6, ($$render) => {
@@ -8988,22 +9102,22 @@ ${noteText || "No notes."}${taskText}`;
               {
                 var consequent_7 = ($$anchor5) => {
                   var div_5 = root_13();
-                  var button_6 = child(div_5);
-                  var button_7 = sibling(button_6);
+                  var button_7 = child(div_5);
+                  var button_8 = sibling(button_7);
                   reset(div_5);
                   template_effect(() => {
-                    button_6.disabled = get2(proposalBusyId) !== null;
                     button_7.disabled = get2(proposalBusyId) !== null;
+                    button_8.disabled = get2(proposalBusyId) !== null;
                   });
-                  delegated("click", button_6, () => void applyProposal(get2(review)));
-                  delegated("click", button_7, () => void rejectProposal(get2(review)));
+                  delegated("click", button_7, () => void applyProposal(get2(review)));
+                  delegated("click", button_8, () => void rejectProposal(get2(review)));
                   append($$anchor5, div_5);
                 };
                 var consequent_8 = ($$anchor5) => {
-                  var button_8 = root_14();
-                  template_effect(() => button_8.disabled = get2(proposalBusyId) !== null);
-                  delegated("click", button_8, () => void rejectProposal(get2(review)));
-                  append($$anchor5, button_8);
+                  var button_9 = root_14();
+                  template_effect(() => button_9.disabled = get2(proposalBusyId) !== null);
+                  delegated("click", button_9, () => void rejectProposal(get2(review)));
+                  append($$anchor5, button_9);
                 };
                 if_block(node_10, ($$render) => {
                   if (get2(review).state === "ready" && get2(review).parsed) $$render(consequent_7);
@@ -9036,7 +9150,7 @@ ${noteText || "No notes."}${taskText}`;
         var span_3 = child(div_7);
         var text_12 = child(span_3);
         reset(span_3);
-        var button_9 = sibling(span_3);
+        var button_10 = sibling(span_3);
         reset(div_7);
         reset(div_6);
         var div_8 = sibling(div_6, 2);
@@ -9089,20 +9203,20 @@ ${noteText || "No notes."}${taskText}`;
         action(textarea, ($$node, $$action_arg) => autoResizeTask?.($$node, $$action_arg), () => get2(editorText));
         reset(div_8);
         var div_11 = sibling(div_8, 4);
-        var button_10 = child(div_11);
-        var span_5 = child(button_10);
+        var button_11 = child(div_11);
+        var span_5 = child(button_11);
         var text_13 = child(span_5, true);
         reset(span_5);
         var span_6 = sibling(span_5, 2);
         var text_14 = child(span_6, true);
         reset(span_6);
-        reset(button_10);
-        var node_12 = sibling(button_10, 2);
+        reset(button_11);
+        var node_12 = sibling(button_11, 2);
         {
           var consequent_12 = ($$anchor3) => {
-            var button_11 = root_20();
-            delegated("click", button_11, () => void restore(get2(undoRootId)));
-            append($$anchor3, button_11);
+            var button_12 = root_20();
+            delegated("click", button_12, () => void restore(get2(undoRootId)));
+            append($$anchor3, button_12);
           };
           if_block(node_12, ($$render) => {
             if (get2(undoRootId)) $$render(consequent_12);
@@ -9139,7 +9253,7 @@ ${noteText || "No notes."}${taskText}`;
                 var time = child(footer);
                 var text_16 = child(time, true);
                 reset(time);
-                var button_12 = sibling(time);
+                var button_13 = sibling(time);
                 reset(footer);
                 reset(article_1);
                 template_effect(
@@ -9149,7 +9263,7 @@ ${noteText || "No notes."}${taskText}`;
                   },
                   [() => new Date(get2(root).archived_at).toLocaleDateString()]
                 );
-                delegated("click", button_12, () => void restore(get2(root).id));
+                delegated("click", button_13, () => void restore(get2(root).id));
                 append($$anchor4, article_1);
               },
               ($$anchor4) => {
@@ -9172,18 +9286,18 @@ ${noteText || "No notes."}${taskText}`;
         var node_15 = child(div_15);
         {
           var consequent_14 = ($$anchor3) => {
-            var button_13 = root_25();
-            var text_17 = child(button_13, true);
-            reset(button_13);
+            var button_14 = root_25();
+            var text_17 = child(button_14, true);
+            reset(button_14);
             template_effect(() => set_text(text_17, get2(allNotesCollapsed) ? "Expand all" : "Collapse all"));
-            delegated("click", button_13, () => void toggleAllNotes());
-            append($$anchor3, button_13);
+            delegated("click", button_14, () => void toggleAllNotes());
+            append($$anchor3, button_14);
           };
           if_block(node_15, ($$render) => {
             if (get2(dayNotes).length > 1) $$render(consequent_14);
           });
         }
-        var button_14 = sibling(node_15);
+        var button_15 = sibling(node_15);
         reset(div_15);
         reset(div_14);
         var div_16 = sibling(div_14, 2);
@@ -9196,29 +9310,29 @@ ${noteText || "No notes."}${taskText}`;
             var article_2 = root_31();
             let classes_5;
             var header_1 = child(article_2);
-            var button_15 = child(header_1);
-            var span_7 = child(button_15);
+            var button_16 = child(header_1);
+            var span_7 = child(button_16);
             var text_18 = child(span_7, true);
             reset(span_7);
             var span_8 = sibling(span_7);
             var text_19 = child(span_8, true);
             reset(span_8);
-            reset(button_15);
-            var div_17 = sibling(button_15, 2);
-            var button_16 = child(div_17);
-            var node_16 = sibling(button_16);
+            reset(button_16);
+            var div_17 = sibling(button_16, 2);
+            var button_17 = child(div_17);
+            var node_16 = sibling(button_17);
             {
               var consequent_15 = ($$anchor4) => {
-                var button_17 = root_26();
+                var button_18 = root_26();
                 template_effect(
                   ($0) => {
-                    set_attribute2(button_17, "aria-label", `Expand note ${get2(index2) + 1} to fit content`);
-                    button_17.disabled = $0;
+                    set_attribute2(button_18, "aria-label", `Expand note ${get2(index2) + 1} to fit content`);
+                    button_18.disabled = $0;
                   },
                   [() => get2(deletingNotes).has(get2(note).id)]
                 );
-                delegated("click", button_17, () => expandNoteToContent(get2(note).id));
-                append($$anchor4, button_17);
+                delegated("click", button_18, () => expandNoteToContent(get2(note).id));
+                append($$anchor4, button_18);
               };
               if_block(node_16, ($$render) => {
                 if (!get2(note).collapsed) $$render(consequent_15);
@@ -9228,17 +9342,17 @@ ${noteText || "No notes."}${taskText}`;
             {
               var consequent_16 = ($$anchor4) => {
                 var fragment_3 = root_27();
-                var button_18 = sibling(first_child(fragment_3));
-                var text_20 = child(button_18, true);
-                reset(button_18);
-                var button_19 = sibling(button_18);
+                var button_19 = sibling(first_child(fragment_3));
+                var text_20 = child(button_19, true);
+                reset(button_19);
+                var button_20 = sibling(button_19);
                 template_effect(
                   ($0, $1, $2) => {
-                    set_attribute2(button_18, "aria-label", `Confirm delete note ${get2(index2) + 1}`);
-                    button_18.disabled = $0;
+                    set_attribute2(button_19, "aria-label", `Confirm delete note ${get2(index2) + 1}`);
+                    button_19.disabled = $0;
                     set_text(text_20, $1);
-                    set_attribute2(button_19, "aria-label", `Cancel delete note ${get2(index2) + 1}`);
-                    button_19.disabled = $2;
+                    set_attribute2(button_20, "aria-label", `Cancel delete note ${get2(index2) + 1}`);
+                    button_20.disabled = $2;
                   },
                   [
                     () => get2(deletingNotes).has(get2(note).id),
@@ -9246,15 +9360,15 @@ ${noteText || "No notes."}${taskText}`;
                     () => get2(deletingNotes).has(get2(note).id)
                   ]
                 );
-                delegated("click", button_18, () => void deleteNote(get2(note)));
-                delegated("click", button_19, () => set(deleteNoteConfirmation, null));
+                delegated("click", button_19, () => void deleteNote(get2(note)));
+                delegated("click", button_20, () => set(deleteNoteConfirmation, null));
                 append($$anchor4, fragment_3);
               };
               var alternate_1 = ($$anchor4) => {
-                var button_20 = root_28();
-                template_effect(() => set_attribute2(button_20, "aria-label", `Delete note ${get2(index2) + 1}`));
-                delegated("click", button_20, () => set(deleteNoteConfirmation, get2(note).id, true));
-                append($$anchor4, button_20);
+                var button_21 = root_28();
+                template_effect(() => set_attribute2(button_21, "aria-label", `Delete note ${get2(index2) + 1}`));
+                delegated("click", button_21, () => set(deleteNoteConfirmation, get2(note).id, true));
+                append($$anchor4, button_21);
               };
               if_block(node_17, ($$render) => {
                 if (get2(deleteNoteConfirmation) === get2(note).id) $$render(consequent_16);
@@ -9271,8 +9385,8 @@ ${noteText || "No notes."}${taskText}`;
                 remove_textarea_child(textarea_1);
                 action(textarea_1, ($$node, $$action_arg) => rememberNoteHeight?.($$node, $$action_arg), () => get2(note).id);
                 var div_19 = sibling(textarea_1, 2);
-                var button_21 = child(div_19);
-                var select = sibling(button_21, 2);
+                var button_22 = child(div_19);
+                var select = sibling(button_22, 2);
                 var node_19 = sibling(select, 2);
                 {
                   var consequent_17 = ($$anchor5) => {
@@ -9285,7 +9399,7 @@ ${noteText || "No notes."}${taskText}`;
                     if (get2(rewriteOperation) === "translate") $$render(consequent_17);
                   });
                 }
-                var button_22 = sibling(node_19, 2);
+                var button_23 = sibling(node_19, 2);
                 reset(div_19);
                 reset(div_18);
                 template_effect(
@@ -9297,8 +9411,8 @@ ${noteText || "No notes."}${taskText}`;
                     set_attribute2(textarea_1, "aria-busy", $0);
                     set_attribute2(textarea_1, "maxlength", MAX_NOTE_LENGTH);
                     textarea_1.disabled = $1;
-                    button_21.disabled = $2;
-                    button_22.disabled = $3;
+                    button_22.disabled = $2;
+                    button_23.disabled = $3;
                   },
                   [
                     () => get2(deletingNotes).has(get2(note).id),
@@ -9308,10 +9422,10 @@ ${noteText || "No notes."}${taskText}`;
                   ]
                 );
                 delegated("input", textarea_1, (event2) => updateLocalNote(get2(note).id, event2.currentTarget.value));
-                event("blur", textarea_1, () => void saveNote(get2(note).id, true));
-                delegated("click", button_21, () => void extractTasks(get2(note)));
+                event("blur", textarea_1, () => void saveNote(get2(note).id));
+                delegated("click", button_22, () => void extractTasks(get2(note)));
                 bind_select_value(select, () => get2(rewriteOperation), ($$value) => set(rewriteOperation, $$value));
-                delegated("click", button_22, () => void rewrite(get2(note)));
+                delegated("click", button_23, () => void rewrite(get2(note)));
                 append($$anchor4, div_18);
               };
               if_block(node_18, ($$render) => {
@@ -9324,13 +9438,13 @@ ${noteText || "No notes."}${taskText}`;
                 classes_5 = set_class(article_2, 1, "note-block svelte-1u9rne1", null, classes_5, {
                   "search-match": get2(searchTarget)?.kind === "note" && get2(searchTarget).id === get2(note).id
                 });
-                set_attribute2(button_15, "aria-expanded", !get2(note).collapsed);
-                set_attribute2(button_15, "aria-controls", `note-${get2(note).id}`);
-                button_15.disabled = $0;
+                set_attribute2(button_16, "aria-expanded", !get2(note).collapsed);
+                set_attribute2(button_16, "aria-controls", `note-${get2(note).id}`);
+                button_16.disabled = $0;
                 set_text(text_18, get2(note).collapsed ? "\u25B8" : "\u25BE");
                 set_text(text_19, $1);
-                set_attribute2(button_16, "aria-label", `Copy note ${get2(index2) + 1}`);
-                button_16.disabled = $2;
+                set_attribute2(button_17, "aria-label", `Copy note ${get2(index2) + 1}`);
+                button_17.disabled = $2;
               },
               [
                 () => get2(deletingNotes).has(get2(note).id),
@@ -9338,8 +9452,8 @@ ${noteText || "No notes."}${taskText}`;
                 () => !get2(note).content || get2(deletingNotes).has(get2(note).id)
               ]
             );
-            delegated("click", button_15, () => void toggleNote(get2(note)));
-            delegated("click", button_16, () => void copyText(get2(note).content, `Note ${get2(index2) + 1}`));
+            delegated("click", button_16, () => void toggleNote(get2(note)));
+            delegated("click", button_17, () => void copyText(get2(note).content, `Note ${get2(index2) + 1}`));
             append($$anchor3, article_2);
           },
           ($$anchor3) => {
@@ -9356,10 +9470,10 @@ ${noteText || "No notes."}${taskText}`;
         next();
         reset(label_1);
         var div_21 = sibling(label_1, 2);
-        var button_23 = child(div_21);
-        var text_21 = child(button_23, true);
-        reset(button_23);
-        var button_24 = sibling(button_23);
+        var button_24 = child(div_21);
+        var text_21 = child(button_24, true);
+        reset(button_24);
+        var button_25 = sibling(button_24);
         reset(div_21);
         reset(div_20);
         reset(details);
@@ -9374,7 +9488,7 @@ ${noteText || "No notes."}${taskText}`;
             var text_22 = child(p_6);
             reset(p_6);
             reset(div_23);
-            var button_25 = sibling(div_23);
+            var button_26 = sibling(div_23);
             reset(div_22);
             var node_21 = sibling(div_22, 2);
             {
@@ -9383,12 +9497,12 @@ ${noteText || "No notes."}${taskText}`;
                 var pre = first_child(fragment_4);
                 var text_23 = child(pre, true);
                 reset(pre);
-                var button_26 = sibling(pre);
+                var button_27 = sibling(pre);
                 template_effect(() => {
                   set_text(text_23, get2(aiDraft).content);
-                  button_26.disabled = get2(aiConfirming);
+                  button_27.disabled = get2(aiConfirming);
                 });
-                delegated("click", button_26, () => void confirmAi("insert"));
+                delegated("click", button_27, () => void confirmAi("insert"));
                 append($$anchor4, fragment_4);
               };
               var consequent_20 = ($$anchor4) => {
@@ -9411,11 +9525,11 @@ ${noteText || "No notes."}${taskText}`;
                   append($$anchor5, label_2);
                 });
                 reset(fieldset);
-                var button_27 = sibling(fieldset);
-                template_effect(($0) => button_27.disabled = $0, [
+                var button_28 = sibling(fieldset);
+                template_effect(($0) => button_28.disabled = $0, [
                   () => get2(aiConfirming) || !get2(aiDraft).proposals.some((proposal) => proposal.selected)
                 ]);
-                delegated("click", button_27, () => void confirmAi("tasks"));
+                delegated("click", button_28, () => void confirmAi("tasks"));
                 append($$anchor4, fragment_5);
               };
               var alternate_2 = ($$anchor4) => {
@@ -9433,17 +9547,17 @@ ${noteText || "No notes."}${taskText}`;
                 reset(div_26);
                 reset(div_24);
                 var div_27 = sibling(div_24);
-                var button_28 = child(div_27);
-                var button_29 = sibling(button_28);
+                var button_29 = child(div_27);
+                var button_30 = sibling(button_29);
                 reset(div_27);
                 template_effect(() => {
                   set_text(text_25, get2(aiDraft).original);
                   set_text(text_26, get2(aiDraft).proposed);
-                  button_28.disabled = get2(aiConfirming);
                   button_29.disabled = get2(aiConfirming);
+                  button_30.disabled = get2(aiConfirming);
                 });
-                delegated("click", button_28, () => void confirmAi("replace"));
-                delegated("click", button_29, () => void confirmAi("insert"));
+                delegated("click", button_29, () => void confirmAi("replace"));
+                delegated("click", button_30, () => void confirmAi("insert"));
                 append($$anchor4, fragment_6);
               };
               if_block(node_21, ($$render) => {
@@ -9456,11 +9570,11 @@ ${noteText || "No notes."}${taskText}`;
             template_effect(
               ($0) => {
                 set_text(text_22, `From ${$0 ?? ""}`);
-                button_25.disabled = get2(aiConfirming);
+                button_26.disabled = get2(aiConfirming);
               },
               [() => displayDate(get2(aiDraft).sourceDate)]
             );
-            delegated("click", button_25, () => set(aiDraft, null));
+            delegated("click", button_26, () => set(aiDraft, null));
             append($$anchor3, section_3);
           };
           if_block(node_20, ($$render) => {
@@ -9473,17 +9587,17 @@ ${noteText || "No notes."}${taskText}`;
             classes_1 = set_class(p_2, 1, "status svelte-1u9rne1", null, classes_1, $1);
             set_text(text_7, get2(status));
             set_text(text_12, `${$2 ?? ""} open`);
-            button_9.disabled = get2(activeTasks).length === 0;
+            button_10.disabled = get2(activeTasks).length === 0;
             set_attribute2(textarea, "rows", $3);
             set_value(textarea, get2(editorText));
             set_attribute2(textarea, "aria-busy", get2(deletingTasks).size > 0);
             textarea.readOnly = get2(deletingTasks).size > 0;
-            set_attribute2(button_10, "aria-expanded", get2(archiveOpen));
+            set_attribute2(button_11, "aria-expanded", get2(archiveOpen));
             set_text(text_13, get2(archiveOpen) ? "\u25BE" : "\u25B8");
             set_text(text_14, get2(archivedRoots).length);
-            button_23.disabled = get2(aiBusy) || get2(dayNotes).length === 0;
-            set_text(text_21, get2(aiBusy) ? "Working..." : "Summarize day");
             button_24.disabled = get2(aiBusy) || get2(dayNotes).length === 0;
+            set_text(text_21, get2(aiBusy) ? "Working..." : "Summarize day");
+            button_25.disabled = get2(aiBusy) || get2(dayNotes).length === 0;
           },
           [
             () => displayDate(get2(selectedEntry).local_date),
@@ -9492,7 +9606,7 @@ ${noteText || "No notes."}${taskText}`;
             () => Math.max(2, get2(editorLines).length)
           ]
         );
-        delegated("click", button_9, () => void copyText(activeTasksText(), "Tasks"));
+        delegated("click", button_10, () => void copyText(activeTasksText(), "Tasks"));
         delegated("input", textarea, taskEditorInput);
         delegated("keydown", textarea, taskEditorKeydown);
         delegated("beforeinput", textarea, taskEditorBeforeInput);
@@ -9502,11 +9616,11 @@ ${noteText || "No notes."}${taskText}`;
         delegated("click", textarea, (event2) => updateActiveEditorLine(event2.currentTarget));
         delegated("keyup", textarea, (event2) => updateActiveEditorLine(event2.currentTarget));
         event("blur", textarea, () => void taskEditorBlur());
-        delegated("click", button_10, () => set(archiveOpen, !get2(archiveOpen)));
-        delegated("click", button_14, () => void invoke("create_note", { daily_entry_id: get2(selectedEntry).id, content: "" }));
+        delegated("click", button_11, () => set(archiveOpen, !get2(archiveOpen)));
+        delegated("click", button_15, () => void invoke("create_note", { daily_entry_id: get2(selectedEntry).id, content: "" }));
         bind_checked(input_4, () => get2(includeTasks), ($$value) => set(includeTasks, $$value));
-        delegated("click", button_23, () => void summarize());
-        delegated("click", button_24, () => void extractTasks());
+        delegated("click", button_24, () => void summarize());
+        delegated("click", button_25, () => void extractTasks());
         append($$anchor2, fragment_2);
       };
       var alternate_4 = ($$anchor2) => {
@@ -9534,15 +9648,15 @@ ${noteText || "No notes."}${taskText}`;
         var node_24 = sibling(node_23, 2);
         {
           var consequent_24 = ($$anchor3) => {
-            var button_30 = root_41();
-            var text_28 = child(button_30, true);
-            reset(button_30);
+            var button_31 = root_41();
+            var text_28 = child(button_31, true);
+            reset(button_31);
             template_effect(() => {
-              button_30.disabled = get2(loading);
+              button_31.disabled = get2(loading);
               set_text(text_28, get2(loading) ? "Retrying..." : "Retry");
             });
-            delegated("click", button_30, () => void loadInitialDay(initialDate));
-            append($$anchor3, button_30);
+            delegated("click", button_31, () => void loadInitialDay(initialDate));
+            append($$anchor3, button_31);
           };
           if_block(node_24, ($$render) => {
             if (host) $$render(consequent_24);

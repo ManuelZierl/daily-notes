@@ -131,3 +131,93 @@ describe("backend-free Daily Notes surface", () => {
     expect(screen.getByLabelText("Active tasks. One task per line.")).toHaveValue("");
   });
 });
+
+function noteState(content = "Original"): Workspace {
+  return base([], [{ id: "note", daily_entry_id: `day-${today}`, content, order: 0, collapsed: false, created_at: "2026-07-28T10:00:00.000Z", updated_at: "2026-07-28T10:00:00.000Z" }]);
+}
+
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+describe("in-flight edits and refresh recovery", () => {
+  it("defers host event refreshes instead of rebasing dirty note text", async () => {
+    let notify: () => void = () => {};
+    vi.spyOn((globalThis as any).appHost, "onEvent").mockImplementation((callback: unknown) => { notify = callback as () => void; });
+    const api = await ready(noteState());
+    const editor = screen.getByLabelText("Note 1 content");
+    await fireEvent.input(editor, { target: { value: "Unsaved draft" } });
+    const reads = api.requests.filter((request) => request.kind === "readSnapshot").length;
+    notify();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(api.requests.filter((request) => request.kind === "readSnapshot")).toHaveLength(reads);
+    expect(editor).toHaveValue("Unsaved draft");
+  });
+
+  it.each(["note", "task"] as const)("drains newer %s edits when their debounce timer expires during a slow save", async (kind) => {
+    const api = await ready(kind === "note" ? noteState() : base([task("root", "Original", 0)]));
+    const commit = api.commitBatch.bind(api);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let blocked = false;
+    api.commitBatch = async (request) => {
+      if (!blocked) { blocked = true; await gate; }
+      return commit(request);
+    };
+    vi.useFakeTimers();
+    const editor = screen.getByLabelText(kind === "note" ? "Note 1 content" : "Active tasks. One task per line.");
+    const value = (text: string) => kind === "note" ? text : `${text}\n`;
+    await fireEvent.input(editor, { target: { value: value("First edit") } });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(blocked).toBe(true);
+    await fireEvent.input(editor, { target: { value: value("Latest edit") } });
+    await vi.advanceTimersByTimeAsync(500);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.records.get(kind === "note" ? "notes" : "tasks")![0].value[kind === "note" ? "content" : "text"]).toBe("Latest edit");
+    expect(editor).toHaveValue(value("Latest edit"));
+  });
+
+  it("retries a failed rollover instead of treating a missing day as already created", async () => {
+    const api = await ready(base());
+    vi.useFakeTimers();
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    vi.setSystemTime(tomorrow);
+    api.failCommit = true;
+    await fireEvent(document, new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.records.get("days")).toHaveLength(1);
+    api.failCommit = false;
+    await fireEvent(document, new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.records.get("days")).toHaveLength(2);
+    expect(api.records.get("days")!.some((record) => record.value.local_date === localDate(tomorrow))).toBe(true);
+  });
+});
+
+describe("saved-data reload UX", () => {
+  it("keeps an acknowledged note creation visible and reloads without duplicating it", async () => {
+    const api = await ready(base());
+    const read = api.readSnapshot.bind(api);
+    api.readSnapshot = async () => { throw new Error("snapshot unavailable"); };
+    await fireEvent.click(screen.getByRole("button", { name: "Add note" }));
+    await screen.findByLabelText("Note 1 content");
+    expect(api.records.get("notes")).toHaveLength(1);
+    expect(screen.getByRole("alert")).toHaveTextContent(/saved.*reloaded/i);
+    api.readSnapshot = read;
+    await fireEvent.click(screen.getByRole("button", { name: "Reload saved data" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(screen.getByLabelText("Note 1 content")).toHaveValue("");
+    expect(api.records.get("notes")).toHaveLength(1);
+  });
+
+  it("loads external changes on a host event when there are no pending edits", async () => {
+    let notify: () => void = () => {};
+    vi.spyOn((globalThis as any).appHost, "onEvent").mockImplementation((callback: unknown) => { notify = callback as () => void; });
+    const api = await ready(noteState());
+    api.records.get("notes")![0].value.content = "External edit";
+    api.records.get("notes")![0].revision += 1;
+    api.generation += 1;
+    notify();
+    await waitFor(() => expect(screen.getByLabelText("Note 1 content")).toHaveValue("External edit"));
+  });
+});

@@ -1,4 +1,5 @@
 import type { DailyEntry, NoteBlock, Task, Workspace } from "../shared/types";
+import { validateWorkspace } from "../shared/workspaceValidation";
 
 export type RecordValue = Record<string, unknown>;
 
@@ -58,12 +59,12 @@ function requireString(value: unknown, label: string): string {
 }
 
 function requirePositiveInteger(value: unknown, label: string): number {
-  if (!Number.isInteger(value) || (value as number) < 1) throw new DataAdapterError(`${label} must be a positive integer`);
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new DataAdapterError(`${label} must be a positive integer`);
   return value as number;
 }
 
 function requireGeneration(value: unknown, label: string): number {
-  if (!Number.isInteger(value) || (value as number) < 0) throw new DataAdapterError(`${label} must be a non-negative integer`);
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new DataAdapterError(`${label} must be a non-negative integer`);
   return value as number;
 }
 
@@ -157,6 +158,7 @@ function isConflict(error: unknown): boolean {
 
 export class DataAdapter {
   private generation = 0;
+  private reloadWarning: string | null = null;
   private records = new Map<CollectionName, ManagedRecord[]>();
 
   constructor(private readonly api: DataV2) {}
@@ -177,20 +179,43 @@ export class DataAdapter {
       { kind: "record-list", collection: "notes", query: { limit: 1000 } },
       { kind: "record-list", collection: "applied-proposals", query: { limit: 1000 } },
     ];
-    const snapshot = parseSnapshot(await this.api.readSnapshot({ expectedGeneration: this.generation || undefined, reads }), reads);
-    this.generation = snapshot.generation;
-    this.records = snapshot.records;
-    for (const collection of ["days", "tasks", "notes", "applied-proposals"] as const) {
-      let after = snapshot.nextAfter.get(collection) ?? null;
-      while (after !== null) {
-        const page: ReadRequest = { kind: "record-list", collection, query: { after, limit: 1000 } };
-        const next = parseSnapshot(await this.api.readSnapshot({ expectedGeneration: this.generation, reads: [page] }), [page]);
-        if (next.generation !== this.generation) throw new DataConflictError("Daily Notes changed while it was being read. Reload and try again.");
-        this.records.set(collection, [...(this.records.get(collection) ?? []), ...(next.records.get(collection) ?? [])]);
-        after = next.nextAfter.get(collection) ?? null;
+    try {
+      // A refresh starts a new snapshot. Only continuation pages are pinned.
+      const snapshot = parseSnapshot(await this.api.readSnapshot({ reads }), reads);
+      const records = snapshot.records;
+      for (const collection of ["days", "tasks", "notes", "applied-proposals"] as const) {
+        const cursors = new Set<string>();
+        let after = snapshot.nextAfter.get(collection) ?? null;
+        while (after !== null) {
+          if (!after || cursors.has(after)) throw new DataAdapterError("Kestral returned a repeated or empty pagination cursor.");
+          cursors.add(after);
+          const page: ReadRequest = { kind: "record-list", collection, query: { after, limit: 1000 } };
+          const next = parseSnapshot(await this.api.readSnapshot({ expectedGeneration: snapshot.generation, reads: [page] }), [page]);
+          if (next.generation !== snapshot.generation) throw new DataConflictError("Daily Notes changed while it was being read. Reload and try again.");
+          records.set(collection, [...(records.get(collection) ?? []), ...(next.records.get(collection) ?? [])]);
+          if (records.get(collection)!.length > 10_000 || cursors.size > 10_000) throw new DataAdapterError("Daily Notes collection exceeds its supported size.");
+          after = next.nextAfter.get(collection) ?? null;
+        }
+        const items = records.get(collection) ?? [];
+        if (new Set(items.map((record) => record.id)).size !== items.length || new Set(items.map((record) => record.value.id)).size !== items.length) {
+          throw new DataAdapterError(`Kestral returned duplicate records in '${collection}'.`);
+        }
       }
+      const workspace = this.workspaceFrom(records);
+      validateWorkspace(workspace);
+      // Publish records, generation, and domain state together, never a partial read.
+      this.records = records;
+      this.generation = snapshot.generation;
+      this.reloadWarning = null;
+      return workspace;
+    } catch (error) {
+      if (isConflict(error)) throw new DataConflictError("Daily Notes changed while it was being read. Reload and try again.");
+      throw error;
     }
-    return this.workspace();
+  }
+
+  refreshWarning(): string | null {
+    return this.reloadWarning;
   }
 
   currentGeneration(): number {
@@ -201,15 +226,14 @@ export class DataAdapter {
     return new Map([...this.records.entries()].map(([collection, records]) => [collection, structuredClone(records)]));
   }
 
-  setSnapshot(generation: number, records: Map<CollectionName, ManagedRecord[]>): void {
-    this.generation = generation;
-    this.records = records;
+  workspace(): Workspace {
+    return this.workspaceFrom(this.records);
   }
 
-  workspace(): Workspace {
-    const dayRecords = this.records.get("days") ?? [];
-    const taskRecords = this.records.get("tasks") ?? [];
-    const noteRecords = this.records.get("notes") ?? [];
+  private workspaceFrom(records: Map<CollectionName, ManagedRecord[]>): Workspace {
+    const dayRecords = records.get("days") ?? [];
+    const taskRecords = records.get("tasks") ?? [];
+    const noteRecords = records.get("notes") ?? [];
     const entries: DailyEntry[] = dayRecords.map((record) => ({
       id: requireString(record.value.id, "days.value.id"),
       local_date: requireString(record.value.local_date, "days.value.local_date"),
@@ -236,12 +260,11 @@ export class DataAdapter {
       created_at: record.createdAt,
       updated_at: record.updatedAt,
     }));
-    this.applyRanks(entries, tasks, notes);
+    this.applyRanks(entries, tasks, notes, records);
     return { version: 1, entries, tasks, notes };
   }
 
-  private applyRanks(entries: DailyEntry[], tasks: Task[], notes: NoteBlock[]): void {
-    const byCollection = this.records;
+  private applyRanks(entries: DailyEntry[], tasks: Task[], notes: NoteBlock[], byCollection: Map<CollectionName, ManagedRecord[]>): void {
     const rank = (collection: CollectionName, id: string): string => {
       const record = (byCollection.get(collection) ?? []).find((candidate) => candidate.value.id === id);
       return typeof record?.value.rank === "string" ? record.value.rank : "";
@@ -270,6 +293,7 @@ export class DataAdapter {
   }
 
   async commit(expectedGeneration: number, mutationId: string, operations: MutationOperation[]): Promise<void> {
+    if (this.reloadWarning !== null) throw new DataAdapterError(this.reloadWarning);
     if (operations.length === 0) return;
     if (operations.length > 2048) throw new DataAdapterError("Daily Notes mutation exceeds the data.v2 batch limit of 2048 operations.");
     let batchId: string | null = null;
@@ -281,7 +305,7 @@ export class DataAdapter {
         await this.api.appendBatchOperations({ batchId, mutationId: childMutationId(mutationId, `append-${offset / 64}`), operations: operations.slice(offset, offset + 64) });
       }
       const committed = requireObject(await this.api.commitBatch({ batchId, mutationId: childMutationId(mutationId, "commit") }), "data.v2 commit");
-      this.generation = requirePositiveInteger(committed.generation, "data.v2 commit.generation");
+      if (requirePositiveInteger(committed.generation, "data.v2 commit.generation") !== expectedGeneration + 1) throw new DataAdapterError("data.v2 commit returned an invalid generation");
     } catch (error) {
       if (batchId !== null) {
         try {
@@ -293,6 +317,13 @@ export class DataAdapter {
       if (isConflict(error)) throw new DataConflictError(undefined);
       throw new DataAdapterError("Daily Notes data could not be saved.", { cause: error });
     }
-    await this.readWorkspace();
+    // The host acknowledged the write. A failed follow-up read must not turn
+    // that success into a retryable create or publish stale host revisions.
+    this.reloadWarning = "Changes were saved, but could not be reloaded. Reload saved data before making further changes.";
+    try {
+      await this.readWorkspace();
+    } catch {
+      // Keep the last complete record snapshot and block writes until refresh.
+    }
   }
 }

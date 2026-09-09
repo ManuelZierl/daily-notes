@@ -93,6 +93,8 @@
   let undoRootId = $state<string | null>(null);
   let deleteNoteConfirmation = $state<string | null>(null);
   let searchTarget = $state<{ kind: "note" | "task"; id: string } | null>(null);
+  let disposed = false;
+  let rolloverInProgress = false;
   let rolloverTimer: ReturnType<typeof setTimeout> | null = null;
   let captureConversionTimer: ReturnType<typeof setTimeout> | null = null;
   const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -243,9 +245,9 @@
         default: throw new Error(`Unknown Daily Notes operation '${capability}'`);
       }
       if (isCurrentResponse(sequence)) {
-        error = null;
+        error = data?.refreshWarning() ?? null;
         applyWorkspace(next, sequence);
-        status = hasPendingEdits() ? "Unsaved changes" : "Saved locally";
+        status = error ? "Saved; reload required" : hasPendingEdits() ? "Unsaved changes" : "Saved locally";
       }
       return next;
     } catch (failure) {
@@ -271,9 +273,9 @@
         checked: input.checked as boolean | undefined,
       });
       if (isCurrentResponse(sequence)) {
-        error = null;
+        error = data?.refreshWarning() ?? null;
         applyWorkspace(created.workspace, sequence);
-        status = hasPendingEdits() ? "Unsaved changes" : "Saved locally";
+        status = error ? "Saved; reload required" : hasPendingEdits() ? "Unsaved changes" : "Saved locally";
       }
       return created;
     } catch (failure) {
@@ -318,6 +320,16 @@
     }
   }
 
+  async function reloadWorkspace(): Promise<void> {
+    // A deliberate reload after a conflict keeps drafts, but does not auto-retry them.
+    for (const timer of saveTimers.values()) clearTimeout(timer);
+    saveTimers.clear();
+    const next = await invoke("get_workspace", {}, { failureStatus: "Refresh failed" });
+    if (!next) return;
+    if (hasPendingEdits()) status = "Workspace reloaded. Unsaved drafts retained; review before saving.";
+    await refreshProposals();
+  }
+
   async function refreshProposals(): Promise<void> {
     if (!host || !store) return;
     try {
@@ -339,14 +351,15 @@
   }
 
   async function applyProposal(review: ProposalReview): Promise<void> {
-    if (review.state !== "ready" || !review.parsed || !store) return;
-    if (!(await flushPendingEdits())) return;
+    if (proposalBusyId !== null || review.state !== "ready" || !review.parsed || !store) return;
     const artifactId = review.artifact.artifact_id;
     proposalBusyId = artifactId;
     try {
+      if (!(await flushPendingEdits())) return;
       const next = await store.applyTaskProposal(artifactId, review.parsed.targetGeneration, review.parsed.payload);
-      workspace = next;
-      status = "Task proposal applied";
+      workspace = mergeLocalEdits(next);
+      error = data?.refreshWarning() ?? null;
+      status = error ? "Saved; reload required" : "Task proposal applied";
       markProposalHandled(artifactId);
       await refreshProposals();
     } catch (failure) {
@@ -359,12 +372,13 @@
   }
 
   async function rejectProposal(review: ProposalReview): Promise<void> {
-    if (!review.parsed || !store || review.state === "replayed") return;
+    if (proposalBusyId !== null || !review.parsed || !store || review.state === "replayed") return;
     const artifactId = review.artifact.artifact_id;
     proposalBusyId = artifactId;
     try {
       await store.rejectTaskProposal(artifactId, review.parsed.targetGeneration);
-      status = "Task proposal rejected";
+      error = data?.refreshWarning() ?? null;
+      status = error ? "Saved; reload required" : "Task proposal rejected";
       markProposalHandled(artifactId);
       await refreshProposals();
     } catch (failure) {
@@ -500,7 +514,7 @@
     if (deletingTasks.has(task.id)) return;
     deletingTasks = new Set(deletingTasks).add(task.id);
     try {
-      if (!(await saveTask(task.id, true))) return;
+      if (!(await saveTask(task.id))) return;
       if (!workspace.tasks.some((candidate) => candidate.id === task.id)) return;
       const next = await invoke("delete_task", { id: task.id });
       if (next) {
@@ -514,14 +528,14 @@
     }
   }
 
-  async function saveTask(id: string, flushLatest = false): Promise<boolean> {
+  async function saveTask(id: string): Promise<boolean> {
     const timer = saveTimers.get(id);
     if (timer) clearTimeout(timer);
     saveTimers.delete(id);
     const pending = taskSaves.get(id);
     if (pending) {
       const saved = await pending;
-      return saved && (!flushLatest || await saveTask(id, true));
+      return saved && await saveTask(id);
     }
     const dirty = dirtyTasks.get(id);
     if (!dirty) return true;
@@ -539,13 +553,14 @@
     } finally {
       if (taskSaves.get(id) === save) taskSaves.delete(id);
     }
-    return saved && (!flushLatest || await saveTask(id, true));
+    // A newer revision may have consumed its debounce timer during this save.
+    return saved && await saveTask(id);
   }
 
   async function normalizeAndSaveTask(task: Task, value: string): Promise<void> {
     const normalized = normalizeTaskText(value);
     if (normalized.text !== value) updateLocalTask(task.id, normalized.text);
-    if (!(await saveTask(task.id, true))) return;
+    if (!(await saveTask(task.id))) return;
     if (normalized.checked !== null && normalized.checked !== task.checked) await toggleTask(task.id, normalized.checked);
   }
 
@@ -767,7 +782,7 @@
       }
     }
     const id = await editorLineTaskId(line);
-    if (!id || !(await saveTask(id, true))) return;
+    if (!id || !(await saveTask(id))) return;
     const next = await invoke("move_task", { id, direction });
     if (next) await focusEditorLine(id, relative);
   }
@@ -843,7 +858,7 @@
     }
 
     for (const id of new Set([...(keepId ? [keepId] : []), ...removeIds])) {
-      if (!(await saveTask(id, true))) return;
+      if (!(await saveTask(id))) return;
     }
 
     if (removeIds.length > 0) {
@@ -853,7 +868,7 @@
       if (keepId) discardTaskEdit(keepId);
     } else if (keepLine) {
       updateEditorLine(keepLine, edit.text);
-      if (keepId && !(await saveTask(keepId, true))) return;
+      if (keepId && !(await saveTask(keepId))) return;
     }
 
     if (removeLines.some((line) => line.kind === "capture")) {
@@ -995,7 +1010,7 @@
   }
 
   async function toggleTask(id: string, checked: boolean): Promise<void> {
-    if (!(await saveTask(id, true))) return;
+    if (!(await saveTask(id))) return;
     const task = workspace.tasks.find((candidate) => candidate.id === id);
     const next = await invoke("toggle_task", { id, checked });
     if (next && task?.parent_id === null && checked) {
@@ -1022,14 +1037,14 @@
     saveTimers.set(id, setTimeout(() => void saveNote(id), 500));
   }
 
-  async function saveNote(id: string, flushLatest = false): Promise<boolean> {
+  async function saveNote(id: string): Promise<boolean> {
     const timer = saveTimers.get(id);
     if (timer) clearTimeout(timer);
     saveTimers.delete(id);
     const pending = noteSaves.get(id);
     if (pending) {
       const saved = await pending;
-      return saved && (!flushLatest || await saveNote(id, true));
+      return saved && await saveNote(id);
     }
     const dirty = dirtyNotes.get(id);
     if (!dirty) return true;
@@ -1047,14 +1062,15 @@
     } finally {
       if (noteSaves.get(id) === save) noteSaves.delete(id);
     }
-    return saved && (!flushLatest || await saveNote(id, true));
+    // A newer revision may have consumed its debounce timer during this save.
+    return saved && await saveNote(id);
   }
 
   async function deleteNote(note: NoteBlock): Promise<void> {
     if (deletingNotes.has(note.id)) return;
     deletingNotes = new Set(deletingNotes).add(note.id);
     try {
-      if (!(await saveNote(note.id, true))) return;
+      if (!(await saveNote(note.id))) return;
       const next = await invoke("delete_note", { id: note.id });
       if (next) {
         const timer = saveTimers.get(note.id);
@@ -1076,7 +1092,7 @@
     const collapsed = !note.collapsed;
     pendingCollapsed.set(note.id, collapsed);
     workspace = { ...workspace, notes: workspace.notes.map((candidate) => candidate.id === note.id ? { ...candidate, collapsed } : candidate) };
-    if (!(await saveNote(note.id, true))) {
+    if (!(await saveNote(note.id))) {
       pendingCollapsed.delete(note.id);
       workspace = { ...workspace, notes: workspace.notes.map((candidate) => candidate.id === note.id ? { ...candidate, collapsed: note.collapsed } : candidate) };
       return;
@@ -1087,7 +1103,7 @@
   }
 
   async function flushNoteEdits(): Promise<boolean> {
-    for (const id of new Set([...dirtyNotes.keys(), ...noteSaves.keys()])) if (!(await saveNote(id, true))) return false;
+    for (const id of new Set([...dirtyNotes.keys(), ...noteSaves.keys()])) if (!(await saveNote(id))) return false;
     return true;
   }
 
@@ -1096,7 +1112,7 @@
     for (const pending of pendingTasks.values()) {
       if (!pending.hidden && await startPendingTaskCreation(pending.id) === null) return false;
     }
-    for (const id of new Set([...dirtyTasks.keys(), ...taskSaves.keys()])) if (!(await saveTask(id, true))) return false;
+    for (const id of new Set([...dirtyTasks.keys(), ...taskSaves.keys()])) if (!(await saveTask(id))) return false;
     return flushNoteEdits();
   }
 
@@ -1238,7 +1254,7 @@
   }
 
   async function rewrite(note: NoteBlock): Promise<void> {
-    if (!(await saveNote(note.id, true))) return;
+    if (!(await saveNote(note.id))) return;
     const original = workspace.notes.find((candidate) => candidate.id === note.id)?.content ?? note.content;
     if (rewriteOperation === "translate" && !rewriteLanguage.trim()) {
       error = "Enter a target language before translating. Your note was not changed.";
@@ -1282,26 +1298,36 @@
     }
   }
 
-  function scheduleRollover(): void {
+  function scheduleRollover(retry = false): void {
     if (rolloverTimer) clearTimeout(rolloverTimer);
+    if (disposed) return;
     const now = new Date();
     const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 1);
-    rolloverTimer = setTimeout(() => void checkRollover(), next.getTime() - now.getTime());
+    rolloverTimer = setTimeout(() => void checkRollover(), retry ? 30_000 : next.getTime() - now.getTime());
   }
 
   async function checkRollover(): Promise<void> {
-    const nextToday = localDate();
-    if (nextToday !== today) {
-      const viewedCurrent = selectedDate === today;
-      today = nextToday;
+    if (disposed || rolloverInProgress || !store) return;
+    rolloverInProgress = true;
+    let retry = false;
+    try {
+      const nextToday = localDate();
+      if (nextToday === today) return;
+      const previousToday = today;
+      const viewedCurrent = selectedDate === previousToday;
+      // Save text before day creation cleans up transient empty task records.
+      if (!(await flushPendingEdits()) || disposed) { retry = true; return; }
       const next = await invoke("get_or_create_day", { local_date: nextToday }, { showBusy: false, failureStatus: "Refresh failed" });
-      if (next && viewedCurrent && await flushPendingEdits()) {
+      if (!next || disposed) { retry = true; return; }
+      today = nextToday;
+      if (viewedCurrent && selectedDate === previousToday) {
         selectedDate = nextToday;
         void persistSelectedDate(nextToday);
-      }
-      else if (next) status = `A new daily entry is ready for ${nextToday}.`;
+      } else status = `A new daily entry is ready for ${nextToday}.`;
+    } finally {
+      rolloverInProgress = false;
+      scheduleRollover(retry);
     }
-    scheduleRollover();
   }
 
   function loadInitialDay(date: string): Promise<void> {
@@ -1349,8 +1375,15 @@
       error = "Kestral's data.v2 bridge is unavailable.";
       return;
     }
+    disposed = false;
     host.ready();
-    host.onEvent?.(() => void store?.refresh().then((next) => { workspace = next; return refreshProposals(); }).catch((failure) => { error = failure instanceof Error ? failure.message : String(failure); status = "Refresh failed"; }));
+    host.onEvent?.(() => {
+      if (disposed || !store) return;
+      // Do not silently rebase unsaved edits onto another window's changes.
+      if (hasPendingEdits()) { void refreshProposals(); return; }
+      void invoke("get_workspace", {}, { showBusy: false, failureStatus: "Refresh failed" })
+        .then((next) => { if (next && !disposed) return refreshProposals(); });
+    });
     const visibility = () => {
       if (document.hidden) void flushPendingEdits();
       else void checkRollover();
@@ -1359,6 +1392,7 @@
     void loadInitialDay(initialDate);
     scheduleRollover();
     return () => {
+      disposed = true;
       document.removeEventListener("visibilitychange", visibility);
       if (rolloverTimer) clearTimeout(rolloverTimer);
       if (captureConversionTimer) clearTimeout(captureConversionTimer);
@@ -1407,7 +1441,7 @@
       </header>
 
        <p class:failure={status.endsWith("failed")} class="status" aria-live="polite">{status}</p>
-       {#if error}<div class="error" role="alert"><span>{error}</span><div class="button-group">{#if hasFailedTaskCreation}<button type="button" class="secondary" onclick={() => void retryTaskCreations()}>Retry task creation</button>{/if}<button type="button" aria-label="Dismiss error" onclick={() => error = null}>Dismiss</button></div></div>{/if}
+       {#if error}<div class="error" role="alert"><span>{error}</span><div class="button-group">{#if hasFailedTaskCreation}<button type="button" class="secondary" onclick={() => void retryTaskCreations()}>Retry task creation</button>{/if}<button type="button" class="secondary" disabled={busy} onclick={() => void reloadWorkspace()}>Reload saved data</button><button type="button" aria-label="Dismiss error" onclick={() => error = null}>Dismiss</button></div></div>{/if}
 
        {#if proposalReviews.length}
          <section class="proposal-inbox" aria-labelledby="proposal-heading">
@@ -1482,7 +1516,7 @@
               </header>
               {#if !note.collapsed}
                 <div id={`note-${note.id}`}>
-                   <textarea value={note.content} data-note-id={note.id} aria-label={`Note ${index + 1} content`} aria-busy={deletingNotes.has(note.id)} maxlength={MAX_NOTE_LENGTH} disabled={deletingNotes.has(note.id)} placeholder="Write a note..." use:rememberNoteHeight={note.id} oninput={(event) => updateLocalNote(note.id, event.currentTarget.value)} onblur={() => void saveNote(note.id, true)}></textarea>
+                   <textarea value={note.content} data-note-id={note.id} aria-label={`Note ${index + 1} content`} aria-busy={deletingNotes.has(note.id)} maxlength={MAX_NOTE_LENGTH} disabled={deletingNotes.has(note.id)} placeholder="Write a note..." use:rememberNoteHeight={note.id} oninput={(event) => updateLocalNote(note.id, event.currentTarget.value)} onblur={() => void saveNote(note.id)}></textarea>
                   <div class="note-actions">
                     <button type="button" class="secondary" disabled={aiBusy || !note.content.trim()} onclick={() => void extractTasks(note)}>Extract tasks</button>
                     <select bind:value={rewriteOperation} aria-label="Rewrite operation"><option>clean up wording</option><option>shorten</option><option>translate</option><option>format as status update</option></select>

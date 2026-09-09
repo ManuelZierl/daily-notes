@@ -139,3 +139,100 @@ describe("frontend data.v2 workspace store", () => {
     await expect(data.readWorkspace()).rejects.toBeInstanceOf(DataAdapterError);
   });
 });
+
+
+describe("workspace operation ordering and proposals", () => {
+  it("serializes simultaneous writes and reads without overlapping host batches", async () => {
+    const { api, store } = await fixture();
+    const first = store.createTasks(["First"]);
+    const refresh = store.refresh();
+    const second = store.createTasks(["Second"]);
+    await Promise.all([first, refresh, second]);
+    expect(store.snapshot().tasks.map((task) => task.text)).toEqual(["First", "Second"]);
+    expect(api.batches.size).toBe(0);
+  });
+
+  it("recovers from a conflict through an explicit refresh without losing the external edit", async () => {
+    const { api, store } = await fixture();
+    await store.createTasks(["Before"]);
+    api.records.get("tasks")![0].value.text = "External edit";
+    api.records.get("tasks")![0].revision += 1;
+    api.generation += 1;
+    await expect(store.createTasks(["Rejected"])).rejects.toBeInstanceOf(DataConflictError);
+    await store.refresh();
+    await store.createTasks(["After refresh"]);
+    expect(store.snapshot().tasks.map((task) => task.text)).toEqual(["External edit", "After refresh"]);
+  });
+
+  it("normalizes active task order when a proposal completes a root before other roots", async () => {
+    const { data, store } = await fixture();
+    await store.createTasks(["Archive", "Keep"]);
+    const root = taskId(store, "Archive");
+    await store.createTask({ text: "Checked child", parent_id: root, after_id: null, checked: true });
+    await store.createTask({ text: "", parent_id: root, after_id: null });
+    await store.applyTaskProposal("proposal-archive", data.currentGeneration(), { operations: [{ kind: "update", taskId: root, checked: true }] });
+    expect(orderedTaskTree(store.snapshot().tasks, false).map((task) => task.text)).toEqual(["Keep"]);
+    expect(orderedTaskTree(store.snapshot().tasks, true).map((task) => [task.text, task.checked])).toEqual([["Archive", true], ["Checked child", true]]);
+    await store.restoreTaskTree(root);
+    expect(orderedTaskTree(store.snapshot().tasks, false).map((task) => [task.text, task.checked])).toEqual([["Archive", false], ["Checked child", true], ["Keep", false]]);
+  });
+
+  it("allows a checked-root creation followed by an active-root creation in one proposal", async () => {
+    const { data, store } = await fixture();
+    await store.applyTaskProposal("proposal-create", data.currentGeneration(), { operations: [{ kind: "create", text: "Done", checked: true }, { kind: "create", text: "Next" }] });
+    expect(orderedTaskTree(store.snapshot().tasks, false).map((task) => task.text)).toEqual(["Next"]);
+  });
+
+  it("checks proposal generations at execution time rather than before a queued write", async () => {
+    const { data, store } = await fixture();
+    const generation = data.currentGeneration();
+    const edit = store.createTasks(["Local edit"]);
+    const proposal = store.applyTaskProposal("queued-proposal", generation, { operations: [{ kind: "create", text: "Stale proposal" }] });
+    await expect(proposal).rejects.toThrow(/stale/);
+    await edit;
+    expect(store.snapshot().tasks.map((task) => task.text)).toEqual(["Local edit"]);
+    expect(store.proposalWasHandled("queued-proposal")).toBe(false);
+  });
+
+  it("checks duplicate proposal receipts inside the operation queue", async () => {
+    const { api, store } = await fixture();
+    const first = store.rejectTaskProposal("same", 0);
+    const second = store.rejectTaskProposal("same", 0);
+    await first;
+    await expect(second).rejects.toThrow(/already been handled/);
+    expect(api.records.get("applied-proposals")).toHaveLength(1);
+  });
+});
+
+describe("acknowledged commit recovery", () => {
+  it("does not report an acknowledged create as failed just because reloading it fails", async () => {
+    const { api, data, store } = await fixture();
+    const read = api.readSnapshot.bind(api);
+    api.readSnapshot = async () => { throw new Error("snapshot temporarily unavailable"); };
+    const created = await store.createTask({ text: "Saved once", parent_id: null, after_id: null });
+    expect(created.workspace.tasks.find((task) => task.id === created.created_id)?.text).toBe("Saved once");
+    expect(api.records.get("tasks")).toHaveLength(1);
+    expect(data.refreshWarning()).toMatch(/saved.*reload/i);
+    await expect(store.createTasks(["Blocked until reload"])).rejects.toThrow(/reload/i);
+    expect(api.records.get("tasks")).toHaveLength(1);
+    expect(api.requests.filter((request) => request.kind === "abortBatch")).toHaveLength(0);
+    api.readSnapshot = read;
+    await store.refresh();
+    expect(data.refreshWarning()).toBeNull();
+    await store.updateTask(created.created_id, "Saved twice, still one task");
+    expect(api.records.get("tasks")).toHaveLength(1);
+  });
+});
+
+describe("archive and restore", () => {
+  it("renumbers surviving children when archiving removes an earlier blank leaf", async () => {
+    const { store } = await fixture();
+    await store.createTasks(["Root"]);
+    const root = taskId(store, "Root");
+    await store.createTask({ text: "", parent_id: root, after_id: null });
+    await store.createTask({ text: "Keep child", parent_id: root, after_id: null });
+    await store.toggleTask(root, true);
+    await store.restoreTaskTree(root);
+    expect(orderedTaskTree(store.snapshot().tasks, false).map((task) => [task.text, task.order])).toEqual([["Root", 0], ["Keep child", 0]]);
+  });
+});

@@ -24,6 +24,8 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - run: npm ci
+      - name: Reject known dependency vulnerabilities
+        run: npm audit --audit-level=moderate
       - run: npm run check
       - run: npm test
       - run: npm run test:package-schema -- .kestral-contract/schemas/app.schema.json
