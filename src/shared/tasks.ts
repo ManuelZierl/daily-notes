@@ -60,3 +60,38 @@ export function localDate(date = new Date()): string {
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
+
+// Shared by direct checkbox changes and reviewed Chat proposals.
+export function archiveTaskTree(tasks: Task[], rootId: string, timestamp: string): Task[] {
+  const ids = new Set([rootId]);
+  const children = new Map<string, Task[]>();
+  for (const task of tasks) {
+    if (task.parent_id !== null) children.set(task.parent_id, [...(children.get(task.parent_id) ?? []), task]);
+  }
+  const visit = (id: string) => {
+    for (const child of children.get(id) ?? []) { ids.add(child.id); visit(child.id); }
+  };
+  visit(rootId);
+  let remaining = tasks;
+  for (;;) {
+    const parents = new Set(remaining.map((task) => task.parent_id));
+    const blanks = new Set(remaining.filter((task) => ids.has(task.id) && !task.text.trim() && !parents.has(task.id)).map((task) => task.id));
+    if (!blanks.size) break;
+    remaining = remaining.filter((task) => !blanks.has(task.id));
+  }
+  for (const task of remaining) {
+    if (ids.has(task.id)) { task.archived_at = timestamp; task.updated_at = timestamp; }
+  }
+  const groups = new Map<string | null, Task[]>();
+  for (const task of remaining) {
+    // Normalize active roots and archived subtree siblings so restoration is valid.
+    if ((task.parent_id === null && task.archived_at === null) || (ids.has(task.id) && task.id !== rootId)) {
+      const owner = task.parent_id;
+      groups.set(owner, [...(groups.get(owner) ?? []), task]);
+    }
+  }
+  for (const siblings of groups.values()) {
+    siblings.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)).forEach((task, index) => { task.order = index; });
+  }
+  return remaining;
+}

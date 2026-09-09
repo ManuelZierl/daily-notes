@@ -119,6 +119,24 @@ empty-row cleanup use the owning surface's private host-managed data store and
 do not create capabilities, grants, or Runs. Chat's proposal capability is the
 only app capability and is consumer-granted to Chat with `requires-approval`.
 
+## Save failures and reloads
+
+Local writes and refreshes are serialized. Edits made while an earlier save is
+in flight are drained after it completes; they do not need another blur to save.
+Automatic host-event refreshes are deferred while drafts are pending, so they
+cannot silently overwrite or rebase those drafts onto another window's changes.
+
+A failed write leaves the draft visible. **Reload saved data** starts a fresh,
+coherent snapshot after a conflict and retains drafts for existing records for
+review; it does not automatically resubmit them. A failed pagination or validation step never
+replaces the last complete snapshot.
+
+When the host has acknowledged a save but its follow-up read fails, Daily Notes
+reports that the changes were saved and a reload is required. It keeps the saved
+result visible and blocks further mutations until a successful reload, rather
+than presenting that acknowledged creation as a failed action to repeat.
+Failed daily rollover is retried without treating a missing day as created.
+
 ## LLM actions and permissions
 
 Daily Notes never contacts a model provider directly and never requests or
@@ -147,7 +165,8 @@ checkbox controls whether task text is sent with a day summary or extraction.
 Daily Notes declares one bounded `propose-task-changes` capability for Chat.
 Chat can propose up to 32 task additions or updates against the `tasks`
 collection generation. The payload is strict, reviewable, and never performs a
-closed-surface mutation. Kestral records the proposal as a typed
+closed-surface mutation. The review shows proposed text, parent placement, and
+completion/archive effects before Apply. Kestral records the proposal as a typed
 `task-change-proposal` artifact under the approved Chat grant.
 
 On load and refresh, Daily Notes lists its own artifacts and shows pending

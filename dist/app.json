@@ -801,7 +801,7 @@
   "integrity": {
     "algorithm": "sha256",
     "assets": {
-      "ui/index.html": "sha256-2febfdbffa9ad391dfeda415aad7b37d99d03ce9b98b078370af78622d74881d",
+      "ui/index.html": "sha256-d0d7fbd7f94ba39d9d1cd793809ba8f747373ba6cc76c145f3b60476f8e11cbb",
       "ui/icon.svg": "sha256-bb1d7c2ba2cbc1adb18ff301d8f3c93e57b22786d0f71f67adbf968b4648fa5a",
       "ui/LICENSE": "sha256-fdfe812ae7f30bf78d5247eb0c62938d8a79f7d4196a5761e3cba415da16683a",
       "ui/THIRD-PARTY-NOTICES.txt": "sha256-11e4d82f77820aad56a65ff32d4c8f90c840a23a7b4a6d765183fed6869259b3"

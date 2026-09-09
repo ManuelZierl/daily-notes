@@ -1,4 +1,6 @@
 import type { Task } from "../shared/types";
+import { archiveTaskTree } from "../shared/tasks";
+import { MAX_ID_LENGTH, MAX_TASK_TEXT_LENGTH } from "../shared/limits.mjs";
 
 export const APP_ID = "kestral.daily-notes";
 export const TASK_PROPOSAL_ARTIFACT = "task-change-proposal";
@@ -118,6 +120,12 @@ function string(value: unknown, label: string): string {
   return value;
 }
 
+function identifier(value: unknown, label: string): string {
+  const result = string(value, label);
+  if (Array.from(result).length > MAX_ID_LENGTH) throw new ProposalValidationError(`${label} exceeds ${MAX_ID_LENGTH} characters`);
+  return result;
+}
+
 function exactKeys(value: Record<string, unknown>, keys: string[], label: string): void {
   if (Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) throw new ProposalValidationError(`${label} has unknown or missing fields`);
 }
@@ -127,16 +135,16 @@ function parseOperation(value: unknown, index: number): TaskProposalOperation {
   if (operation.kind === "create") {
     exactKeys(operation, ["kind", "text", "parentId", "checked"].filter((key) => Object.hasOwn(operation, key)), `payload.operations[${index}]`);
     const text = string(operation.text, `payload.operations[${index}].text`);
-    if (text.length > 500 || text.includes("\r") || text.includes("\n")) throw new ProposalValidationError(`payload.operations[${index}].text is invalid`);
-    if (operation.parentId !== undefined && operation.parentId !== null) string(operation.parentId, `payload.operations[${index}].parentId`);
+    if (Array.from(text).length > MAX_TASK_TEXT_LENGTH || text.includes("\r") || text.includes("\n")) throw new ProposalValidationError(`payload.operations[${index}].text is invalid`);
+    if (operation.parentId !== undefined && operation.parentId !== null) identifier(operation.parentId, `payload.operations[${index}].parentId`);
     if (operation.checked !== undefined && typeof operation.checked !== "boolean") throw new ProposalValidationError(`payload.operations[${index}].checked is invalid`);
     return { kind: "create", text, ...(operation.parentId !== undefined ? { parentId: operation.parentId as string | null } : {}), ...(operation.checked !== undefined ? { checked: operation.checked } : {}) };
   }
   if (operation.kind === "update") {
     exactKeys(operation, ["kind", "taskId", ...(Object.hasOwn(operation, "text") ? ["text"] : []), ...(Object.hasOwn(operation, "checked") ? ["checked"] : [])], `payload.operations[${index}]`);
-    const taskId = string(operation.taskId, `payload.operations[${index}].taskId`);
+    const taskId = identifier(operation.taskId, `payload.operations[${index}].taskId`);
     if (!Object.hasOwn(operation, "text") && !Object.hasOwn(operation, "checked")) throw new ProposalValidationError(`payload.operations[${index}] must change text or checked`);
-    if (operation.text !== undefined && (typeof operation.text !== "string" || operation.text.length > 500 || operation.text.includes("\r") || operation.text.includes("\n"))) throw new ProposalValidationError(`payload.operations[${index}].text is invalid`);
+    if (operation.text !== undefined && (typeof operation.text !== "string" || Array.from(operation.text).length > MAX_TASK_TEXT_LENGTH || operation.text.includes("\r") || operation.text.includes("\n"))) throw new ProposalValidationError(`payload.operations[${index}].text is invalid`);
     if (operation.checked !== undefined && typeof operation.checked !== "boolean") throw new ProposalValidationError(`payload.operations[${index}].checked is invalid`);
     return { kind: "update", taskId, ...(operation.text !== undefined ? { text: operation.text } : {}), ...(operation.checked !== undefined ? { checked: operation.checked } : {}) };
   }
@@ -149,8 +157,8 @@ export function parseTaskProposalArtifact(value: unknown): ParsedTaskProposal {
   if (artifact.artifact_type !== TASK_PROPOSAL_ARTIFACT) throw new ProposalValidationError("artifact type is not a Daily Notes task proposal");
   exactKeys(content, ["targetAppId", "targetKind", "collection", "resourceId", "targetGeneration", "targetRevision", "payload"], "artifact.content");
   if (content.targetAppId !== APP_ID || content.targetKind !== "collection" || content.collection !== "tasks") throw new ProposalValidationError("artifact target is not the Daily Notes tasks collection");
-  string(content.resourceId, "artifact.content.resourceId");
-  if (!Number.isInteger(content.targetGeneration) || (content.targetGeneration as number) < 0) throw new ProposalValidationError("artifact targetGeneration is invalid");
+  if (content.resourceId !== `app-data:${APP_ID}:tasks`) throw new ProposalValidationError("artifact resource identity does not match the Daily Notes tasks collection");
+  if (!Number.isSafeInteger(content.targetGeneration) || (content.targetGeneration as number) < 0) throw new ProposalValidationError("artifact targetGeneration is invalid");
   if (content.targetRevision !== null) throw new ProposalValidationError("collection proposal targetRevision must be null");
   const payload = object(content.payload, "artifact.content.payload");
   exactKeys(payload, ["operations"], "artifact.content.payload");
@@ -162,7 +170,18 @@ export function parseTaskProposalArtifact(value: unknown): ParsedTaskProposal {
     title,
     targetGeneration: content.targetGeneration as number,
     payload: { operations },
-    effects: operations.map((operation) => operation.kind === "create" ? `Add task: ${operation.text}` : `Update task ${operation.taskId}`),
+    effects: operations.map((operation) => {
+      if (operation.kind === "create") {
+        const parent = operation.parentId ? ` under ${operation.parentId}` : "";
+        const completion = operation.checked ? (operation.parentId ? " (completed)" : " (completed; archived root)") : "";
+        return `Add task${parent}: ${operation.text}${completion}`;
+      }
+      const changes = [
+        ...(operation.text !== undefined ? [`text → ${JSON.stringify(operation.text)}`] : []),
+        ...(operation.checked === undefined ? [] : [operation.checked ? "mark complete (archives the tree if this is a root)" : "mark incomplete"]),
+      ];
+      return `Update task ${operation.taskId}: ${changes.join("; ")}`;
+    }),
   };
 }
 
@@ -182,41 +201,30 @@ export function reviewTaskProposalArtifacts(values: unknown[], replayedIds: Set<
   });
 }
 
-export function applyProposalOperations(tasks: Task[], operations: TaskProposalOperation[]): { tasks: Task[]; error?: string } {
-  const next = structuredClone(tasks);
+export function applyProposalOperations(tasks: Task[], operations: TaskProposalOperation[], timestamp = new Date().toISOString(), id: () => string = () => crypto.randomUUID()): { tasks: Task[]; error?: string } {
+  let next = structuredClone(tasks);
   let order = next.filter((task) => task.parent_id === null && task.archived_at === null).length;
   for (const operation of operations) {
     if (operation.kind === "create") {
       if (operation.parentId !== undefined && operation.parentId !== null && !next.some((task) => task.id === operation.parentId && task.archived_at === null)) return { tasks, error: `parent task '${operation.parentId}' is not active` };
-      const createdAt = new Date().toISOString();
-      next.push({ id: `task-${crypto.randomUUID()}`, parent_id: operation.parentId ?? null, text: operation.text, checked: operation.checked ?? false, order: operation.parentId === undefined || operation.parentId === null ? order++ : next.filter((task) => task.parent_id === operation.parentId && task.archived_at === null).length, created_at: createdAt, updated_at: createdAt, completed_at: operation.checked ? createdAt : null, archived_at: operation.checked && (operation.parentId === undefined || operation.parentId === null) ? createdAt : null });
+      const createdAt = timestamp;
+      next.push({ id: `task-${id()}`, parent_id: operation.parentId ?? null, text: operation.text, checked: operation.checked ?? false, order: operation.parentId === undefined || operation.parentId === null ? order++ : next.filter((task) => task.parent_id === operation.parentId && task.archived_at === null).length, created_at: createdAt, updated_at: createdAt, completed_at: operation.checked ? createdAt : null, archived_at: operation.checked && (operation.parentId === undefined || operation.parentId === null) ? createdAt : null });
     } else {
       const task = next.find((candidate) => candidate.id === operation.taskId && candidate.archived_at === null);
       if (!task) return { tasks, error: `task '${operation.taskId}' is not active` };
       if (operation.text !== undefined) task.text = operation.text;
       if (operation.checked !== undefined) {
         task.checked = operation.checked;
-        task.completed_at = operation.checked ? new Date().toISOString() : null;
+        task.completed_at = operation.checked ? timestamp : null;
         if (task.parent_id === null && operation.checked) {
-          const archivedAt = new Date().toISOString();
-          const subtree = [task, ...descendants(next, task.id)];
-          for (const member of subtree) member.archived_at = archivedAt;
+          next = archiveTaskTree(next, task.id, timestamp);
         }
       }
-      task.updated_at = new Date().toISOString();
+      task.updated_at = timestamp;
     }
   }
+  next.filter((task) => task.parent_id === null && task.archived_at === null)
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
+    .forEach((task, index) => { task.order = index; });
   return { tasks: next };
-}
-
-function descendants(tasks: Task[], rootId: string): Task[] {
-  const result: Task[] = [];
-  const visit = (id: string) => {
-    for (const child of tasks.filter((task) => task.parent_id === id)) {
-      result.push(child);
-      visit(child.id);
-    }
-  };
-  visit(rootId);
-  return result;
 }

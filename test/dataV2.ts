@@ -28,11 +28,13 @@ export class MemoryDataV2 implements DataV2 {
   readSnapshot(request: { expectedGeneration?: number; reads: ReadRequest[] }): Promise<unknown> {
     this.requests.push({ kind: "readSnapshot", value: structuredClone(request) });
     if (request.expectedGeneration !== undefined && request.expectedGeneration !== this.generation) return Promise.reject(new Error("generation conflict"));
-    return Promise.resolve({ generation: this.generation, results: request.reads.map((read) => {
+    return Promise.resolve(structuredClone({ generation: this.generation, results: request.reads.map((read) => {
       const records = this.records.get(read.collection)!;
       if (read.kind === "record-get") return { kind: "record-get", record: records.find((record) => record.id === read.id) ?? null };
-      return { kind: "record-list", records: [...records].sort((a, b) => a.id.localeCompare(b.id)), nextAfter: null };
-    }) });
+      const ordered = [...records].sort((a, b) => a.id.localeCompare(b.id)).filter((record) => !read.query?.after || record.id.localeCompare(read.query.after) > 0);
+      const page = ordered.slice(0, read.query?.limit ?? 1000);
+      return { kind: "record-list", records: page, nextAfter: ordered.length > page.length ? page.at(-1)!.id : null };
+    }) }));
   }
 
   beginBatch(request: { expectedGeneration: number; mutationId: string; operations: MutationOperation[]; documents: [] }): Promise<unknown> {

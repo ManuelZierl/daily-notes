@@ -1,5 +1,5 @@
 import type { CreateTaskResult, DailyEntry, NoteBlock, Task, Workspace } from "../shared/types";
-import { orderedTaskTree, parseMarkdownTasks } from "../shared/tasks";
+import { archiveTaskTree, orderedTaskTree, parseMarkdownTasks } from "../shared/tasks";
 import { isLocalDate, validateWorkspace } from "../shared/workspaceValidation";
 import { MAX_IMPORTED_TASKS, MAX_IMPORT_LENGTH, MAX_NOTE_LENGTH, MAX_TASK_DEPTH, MAX_TASK_TEXT_LENGTH } from "../shared/limits.mjs";
 import { DataAdapter, DataAdapterError, type CollectionName, type ManagedRecord, type MutationOperation } from "./dataAdapter";
@@ -120,6 +120,14 @@ function sameValue(left: Record<string, unknown>, right: Record<string, unknown>
 
 export class FrontendWorkspaceStore {
   private workspace: Workspace = { version: 1, entries: [], tasks: [], notes: [] };
+  private operations: Promise<void> = Promise.resolve();
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operations.then(operation);
+    // A failed edit must not poison subsequent explicit refreshes or saves.
+    this.operations = result.then(() => undefined, () => undefined);
+    return result;
+  }
 
   private constructor(private readonly data: DataAdapter, private readonly now: () => Date = () => new Date(), private readonly id: () => string = () => crypto.randomUUID()) {}
 
@@ -131,9 +139,10 @@ export class FrontendWorkspaceStore {
   }
 
   async refresh(): Promise<Workspace> {
-    this.workspace = await this.data.readWorkspace();
-    validateWorkspace(this.workspace);
-    return this.snapshot();
+    return this.enqueue(async () => {
+      this.workspace = await this.data.readWorkspace();
+      return this.snapshot();
+    });
   }
 
   snapshot(): Workspace {
@@ -175,26 +184,29 @@ export class FrontendWorkspaceStore {
     return operations;
   }
 
-  private async transact(mutate: (draft: Workspace, timestamp: string) => void, extraOperations: MutationOperation[] = []): Promise<Workspace> {
-    const draft = clone(this.workspace);
-    mutate(draft, this.now().toISOString());
-    this.sort(draft);
-    validateWorkspace(draft);
-    try {
-      await this.data.commit(this.data.currentGeneration(), this.id(), [...this.operationsFor(draft), ...extraOperations]);
-    } catch (error) {
-      if (error instanceof DataAdapterError) throw error;
-      throw new DataAdapterError("Daily Notes data could not be saved.", { cause: error });
-    }
-    this.workspace = await this.data.readWorkspace();
-    return this.snapshot();
+  private transact(mutate: (draft: Workspace, timestamp: string) => void, extraOperations: MutationOperation[] = []): Promise<Workspace> {
+    return this.enqueue(async () => {
+      const warning = this.data.refreshWarning();
+      if (warning !== null) throw new DataAdapterError(warning);
+      const draft = clone(this.workspace);
+      mutate(draft, this.now().toISOString());
+      this.sort(draft);
+      validateWorkspace(draft);
+      try {
+        await this.data.commit(this.data.currentGeneration(), this.id(), [...this.operationsFor(draft), ...extraOperations]);
+      } catch (error) {
+        if (error instanceof DataAdapterError) throw error;
+        throw new DataAdapterError("Daily Notes data could not be saved.", { cause: error });
+      }
+      // An acknowledged write is successful even when its follow-up read fails.
+      // Retain its validated draft for display, but never use it as host revisions.
+      this.workspace = this.data.refreshWarning() === null ? this.data.workspace() : draft;
+      return this.snapshot();
+    });
   }
 
   async getOrCreateDay(localDate: string): Promise<Workspace> {
     if (!isLocalDate(localDate)) reject("local_date must be a real calendar date using YYYY-MM-DD");
-    const existing = this.workspace.entries.some((entry) => entry.local_date === localDate);
-    const stale = this.workspace.tasks.some((task) => task.archived_at === null && !task.text.trim() && !this.workspace.tasks.some((candidate) => candidate.parent_id === task.id));
-    if (existing && !stale) return this.snapshot();
     return this.transact((draft, timestamp) => {
       for (;;) {
         const blank = draft.tasks.filter((task) => task.archived_at === null && !task.text.trim() && !draft.tasks.some((candidate) => candidate.parent_id === task.id));
@@ -292,15 +304,7 @@ export class FrontendWorkspaceStore {
       task.completed_at = checked ? timestamp : null;
       task.updated_at = timestamp;
       if (task.parent_id === null && checked) {
-        const subtreeIds = new Set([task.id, ...descendants(draft.tasks, task.id).map((member) => member.id)]);
-        for (;;) {
-          const blanks = draft.tasks.filter((candidate) => subtreeIds.has(candidate.id) && !candidate.text.trim() && !draft.tasks.some((possibleChild) => possibleChild.parent_id === candidate.id));
-          if (blanks.length === 0) break;
-          for (const blank of blanks) subtreeIds.delete(blank.id);
-          draft.tasks = draft.tasks.filter((candidate) => !blanks.some((blank) => blank.id === candidate.id));
-        }
-        for (const member of [task, ...descendants(draft.tasks, task.id)]) { member.archived_at = timestamp; member.updated_at = timestamp; }
-        normalizeOrders(draft.tasks, null, false);
+        draft.tasks = archiveTaskTree(draft.tasks, task.id, timestamp);
       }
     });
   }
@@ -450,19 +454,20 @@ export class FrontendWorkspaceStore {
   }
 
   async applyTaskProposal(artifactId: string, targetGeneration: number, payload: TaskProposalPayload): Promise<Workspace> {
-    if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
-    if (this.data.currentGeneration() !== targetGeneration) reject(`this proposal is stale; it targets generation ${targetGeneration}, while the workspace is at generation ${this.data.currentGeneration()}`);
     const receipt = this.proposalReceipt(artifactId, "applied", targetGeneration);
-    return this.transact((draft) => {
-      const result = applyProposalOperations(draft.tasks, payload.operations);
+    return this.transact((draft, timestamp) => {
+      if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
+      if (this.data.currentGeneration() !== targetGeneration) reject(`this proposal is stale; it targets generation ${targetGeneration}, while the workspace is at generation ${this.data.currentGeneration()}`);
+      const result = applyProposalOperations(draft.tasks, payload.operations, timestamp, this.id);
       if (result.error) reject(result.error);
       draft.tasks = result.tasks;
     }, [{ kind: "create", collection: "applied-proposals", value: receipt }]);
   }
 
   async rejectTaskProposal(artifactId: string, targetGeneration: number): Promise<Workspace> {
-    if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
-    return this.transact(() => undefined, [{ kind: "create", collection: "applied-proposals", value: this.proposalReceipt(artifactId, "rejected", targetGeneration) }]);
+    return this.transact(() => {
+      if (this.proposalWasHandled(artifactId)) reject("this proposal has already been handled");
+    }, [{ kind: "create", collection: "applied-proposals", value: this.proposalReceipt(artifactId, "rejected", targetGeneration) }]);
   }
 
   private proposalReceipt(artifactId: string, status: "applied" | "rejected", targetGeneration: number): Record<string, unknown> {
