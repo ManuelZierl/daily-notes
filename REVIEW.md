@@ -53,6 +53,23 @@ The package-schema gate uses the repository's existing pinned Kestral contract
 dependencies; CI checks it against a clean rebuild. The PR's GitHub Actions run
 is the authoritative result for the final published revision.
 
+## Dependency audit
+
+The review-time npm audit reported four affected dependency entries (two high,
+two moderate): `fast-uri`, `nanoid`, `vitest`, and `@vitest/mocker`. The findings
+are in the build/test dependency tree; they do not by themselves demonstrate an
+exploitable path in the installed sandboxed app.
+
+Updated `vitest` 4.1.11, `fast-uri` 3.1.7, `nanoid` 3.3.18. Vitest moves to the patched 4.x line because
+the redirect-mock advisory is not fixed on 3.x; no forced all-dependency upgrade
+or advisory suppression is used. The complete tests, package schema, and
+reproducibility gates pass with this dependency tree, and npm audit reports zero
+known vulnerabilities at review time.
+
+Advisories: [Vitest mocker](https://github.com/advisories/GHSA-82fw-gwwq-j7x9),
+[fast-uri](https://github.com/advisories/GHSA-5jgf-p345-68v8),
+[nanoid](https://github.com/advisories/GHSA-2v37-7h3g-55p8).
+
 ## Boundaries
 
 Mounted UI tests run in jsdom with the host bridge/data.v2 test double. They are
