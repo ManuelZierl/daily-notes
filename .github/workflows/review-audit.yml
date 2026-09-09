@@ -1,0 +1,32 @@
+name: Review dependency audit
+
+on:
+  push:
+    branches: [fix/deep-review-data-integrity]
+    paths: [.github/workflows/review-audit.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci
+      - name: Inspect advisories without changing dependencies
+        run: |
+          npm audit --json > /tmp/daily-notes-audit.json || test "$?" = 1
+          cat /tmp/daily-notes-audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daily-notes-dependency-audit
+          path: /tmp/daily-notes-audit.json
+          retention-days: 1
