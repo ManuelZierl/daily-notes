@@ -32,6 +32,8 @@ jobs:
           cache: npm
       - name: Resolve only the identified security updates
         run: |
+          npm install --global npm@11
+          npm --version
           npm ci
           npm install --save-dev 'vitest@^4.1.11'
           npm update fast-uri nanoid
