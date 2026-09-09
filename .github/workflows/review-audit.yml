@@ -32,9 +32,9 @@ jobs:
           cache: npm
       - name: Resolve only the identified security updates
         run: |
-          npm pkg set 'devDependencies.vitest=^4.1.11'
-          npm install --package-lock-only --ignore-scripts
-          npm update --package-lock-only --ignore-scripts fast-uri nanoid
+          npm ci
+          npm install --save-dev 'vitest@^4.1.11'
+          npm update fast-uri nanoid
           npm ci
           npm ls vitest @vitest/mocker fast-uri nanoid
       - name: Require an advisory-free dependency tree
